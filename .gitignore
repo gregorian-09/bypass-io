@@ -1,0 +1,46 @@
+# Internal project workspace.
+#
+# Keep markdown records tracked so the specification and learning ledger remain
+# versioned, while ignoring downloaded sidecars and future internal scratch data.
+.internal/*
+!.internal/
+!.internal/*.md
+
+# Rust build output.
+/target/
+**/*.rs.bk
+
+# Editor and OS metadata.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+
+# Windows alternate data stream metadata copied into WSL/Linux workspaces.
+*:Zone.Identifier
+
+# Local environment and tool state.
+.env
+.env.*
+!.env.example
+.direnv/
+.vscode/
+.idea/
+
+# Logs and generated reports.
+*.log
+coverage/
+tarpaulin-report.html
+
+# Native build artifacts.
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
