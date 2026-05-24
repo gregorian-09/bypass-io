@@ -6,6 +6,8 @@ pub mod buf;
 pub mod reactor;
 pub mod ring;
 
+#[cfg(feature = "uring")]
+pub use backend::uring::UringBackend;
 pub use backend::{BoxIoFuture, DeviceTarget, IoBackend};
 pub use buf::{BufPool, HugeBuf, HugePageSize, IoVec, IoVecMut, PooledBuf, RawIoVec};
 pub use reactor::{PollReactor, ReactorHandle};

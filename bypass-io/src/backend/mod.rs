@@ -5,6 +5,9 @@
 //! crates can store a backend behind `Arc<dyn IoBackend<Error = E>>` when they
 //! need runtime dispatch.
 
+#[cfg(feature = "uring")]
+pub mod uring;
+
 use std::error::Error;
 use std::future::Future;
 use std::os::fd::RawFd;
