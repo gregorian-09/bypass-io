@@ -8,7 +8,7 @@ description = "Kernel-bypass I/O primitives for Rust systems software"
 rust-version = "1.95"
 
 [features]
-default = []
+default = ["uring"]
 uring = ["dep:io-uring", "dep:libc"]
 spdk = []
 dpdk = []
@@ -16,5 +16,6 @@ simd = []
 numa = []
 
 [dependencies]
+crossbeam-queue = "0.3"
 io-uring = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
