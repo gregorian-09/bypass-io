@@ -1,10 +1,8 @@
 # Internal project workspace.
 #
-# Keep markdown records tracked so the specification and learning ledger remain
-# versioned, while ignoring downloaded sidecars and future internal scratch data.
-.internal/*
-!.internal/
-!.internal/*.md
+# Keep specifications, learning ledgers, scratch notes, and downloaded sidecars
+# local-only unless a file is deliberately moved out of `.internal/`.
+.internal/
 
 # Rust build output.
 /target/
