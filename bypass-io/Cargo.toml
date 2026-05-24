@@ -9,7 +9,7 @@ rust-version = "1.95"
 
 [features]
 default = []
-uring = ["dep:io-uring"]
+uring = ["dep:io-uring", "dep:libc"]
 spdk = []
 dpdk = []
 simd = []
@@ -17,3 +17,4 @@ numa = []
 
 [dependencies]
 io-uring = { version = "0.7", optional = true }
+libc = { version = "0.2", optional = true }

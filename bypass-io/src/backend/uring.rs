@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use io_uring::{opcode, squeue, types, IoUring};
 
 use crate::backend::{BoxIoFuture, DeviceTarget, IoBackend};
-use crate::buf::PooledBuf;
+use crate::buf::{IoVec, IoVecMut, PooledBuf};
 
 /// Phase 1 `io_uring` backend.
 pub struct UringBackend {
@@ -69,6 +69,48 @@ impl UringBackend {
     pub fn write_at(&self, fd: RawFd, buf: &[u8], offset: u64) -> io::Result<usize> {
         let token = self.next_token();
         let entry = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as _)
+            .offset(offset)
+            .build()
+            .user_data(token);
+        self.submit_and_wait(entry, token)
+    }
+
+    /// Read into several buffers from file descriptor `fd` at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error if submission fails, the completion result is
+    /// negative, the vector count is too large, or the backend mutex is
+    /// poisoned.
+    pub fn readv_at(&self, fd: RawFd, bufs: &[IoVecMut<'_>], offset: u64) -> io::Result<usize> {
+        let iovecs = libc_iovecs_mut(bufs)?;
+        if iovecs.is_empty() {
+            return Ok(0);
+        }
+
+        let token = self.next_token();
+        let entry = opcode::Readv::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
+            .offset(offset)
+            .build()
+            .user_data(token);
+        self.submit_and_wait(entry, token)
+    }
+
+    /// Write several buffers to file descriptor `fd` at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error if submission fails, the completion result is
+    /// negative, the vector count is too large, or the backend mutex is
+    /// poisoned.
+    pub fn writev_at(&self, fd: RawFd, bufs: &[IoVec<'_>], offset: u64) -> io::Result<usize> {
+        let iovecs = libc_iovecs(bufs)?;
+        if iovecs.is_empty() {
+            return Ok(0);
+        }
+
+        let token = self.next_token();
+        let entry = opcode::Writev::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
             .offset(offset)
             .build()
             .user_data(token);
@@ -177,17 +219,13 @@ impl IoBackend for UringBackend {
                 ));
             };
 
-            let mut total = 0usize;
-            for buf in bufs {
-                // Safety: each read completes before moving to the next buffer.
-                let slice = unsafe { buf.buf_mut().as_slice_mut() };
-                let n = self.read_at(fd, slice, offset + total as u64)?;
-                total += n;
-                if n < slice.len() {
-                    break;
-                }
-            }
-            Ok(total)
+            let iovecs = bufs
+                .iter_mut()
+                // Safety: `readv_at` completes before this future returns
+                // `Ready`, so the mutable vectors do not outlive the operation.
+                .map(|buf| unsafe { IoVecMut::from_pooled_buf(buf) })
+                .collect::<Vec<_>>();
+            self.readv_at(fd, &iovecs, offset)
         })
     }
 
@@ -205,16 +243,8 @@ impl IoBackend for UringBackend {
                 ));
             };
 
-            let mut total = 0usize;
-            for buf in bufs {
-                let slice = buf.buf().as_slice();
-                let n = self.write_at(fd, slice, offset + total as u64)?;
-                total += n;
-                if n < slice.len() {
-                    break;
-                }
-            }
-            Ok(total)
+            let iovecs = bufs.iter().map(IoVec::from_pooled_buf).collect::<Vec<_>>();
+            self.writev_at(fd, &iovecs, offset)
         })
     }
 
@@ -235,6 +265,46 @@ impl IoBackend for UringBackend {
     }
 }
 
+fn libc_iovecs(bufs: &[IoVec<'_>]) -> io::Result<Vec<libc::iovec>> {
+    if bufs.len() > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many iovecs for io_uring",
+        ));
+    }
+
+    Ok(bufs
+        .iter()
+        .map(|buf| {
+            let raw = buf.as_raw();
+            libc::iovec {
+                iov_base: raw.iov_base,
+                iov_len: raw.iov_len,
+            }
+        })
+        .collect())
+}
+
+fn libc_iovecs_mut(bufs: &[IoVecMut<'_>]) -> io::Result<Vec<libc::iovec>> {
+    if bufs.len() > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many iovecs for io_uring",
+        ));
+    }
+
+    Ok(bufs
+        .iter()
+        .map(|buf| {
+            let raw = buf.as_raw();
+            libc::iovec {
+                iov_base: raw.iov_base,
+                iov_len: raw.iov_len,
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
@@ -245,6 +315,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::UringBackend;
+    use crate::buf::{IoVec, IoVecMut};
 
     static NEXT_TEST_FILE: AtomicUsize = AtomicUsize::new(0);
 
@@ -316,6 +387,46 @@ mod tests {
         let mut all = Vec::new();
         file.read_to_end(&mut all)?;
         assert_eq!(&all, b"--IO----");
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn writev_and_readv_use_single_vectored_operations() -> std::io::Result<()> {
+        let Some(backend) = backend_or_skip() else {
+            return Ok(());
+        };
+
+        let path = temp_file_path("rwv");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let fd = file.as_raw_fd();
+
+        let left = b"hello ";
+        let right = b"uring";
+        let write_iovecs = [IoVec::from_slice(left), IoVec::from_slice(right)];
+        assert_eq!(
+            backend.writev_at(fd, &write_iovecs, 3)?,
+            left.len() + right.len()
+        );
+
+        let mut read_left = [0u8; 6];
+        let mut read_right = [0u8; 5];
+        let read_iovecs = [
+            IoVecMut::from_mut_slice(&mut read_left),
+            IoVecMut::from_mut_slice(&mut read_right),
+        ];
+        assert_eq!(
+            backend.readv_at(fd, &read_iovecs, 3)?,
+            read_left.len() + read_right.len()
+        );
+
+        assert_eq!(&read_left, left);
+        assert_eq!(&read_right, right);
 
         fs::remove_file(path)?;
         Ok(())

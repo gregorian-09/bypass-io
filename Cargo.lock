@@ -13,6 +13,7 @@ name = "bypass-io"
 version = "0.1.0"
 dependencies = [
  "io-uring",
+ "libc",
 ]
 
 [[package]]
