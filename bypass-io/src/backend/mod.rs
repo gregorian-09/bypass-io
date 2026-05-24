@@ -5,6 +5,8 @@
 //! crates can store a backend behind `Arc<dyn IoBackend<Error = E>>` when they
 //! need runtime dispatch.
 
+#[cfg(feature = "spdk")]
+pub mod spdk;
 #[cfg(feature = "uring")]
 pub mod uring;
 
