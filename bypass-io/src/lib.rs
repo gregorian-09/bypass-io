@@ -7,6 +7,6 @@ pub mod reactor;
 pub mod ring;
 
 pub use backend::{BoxIoFuture, DeviceTarget, IoBackend};
-pub use buf::{BufPool, HugeBuf, HugePageSize, PooledBuf};
+pub use buf::{BufPool, HugeBuf, HugePageSize, IoVec, IoVecMut, PooledBuf, RawIoVec};
 pub use reactor::{PollReactor, ReactorHandle};
-pub use ring::SpscRing;
+pub use ring::{MpscRing, SpscRing};

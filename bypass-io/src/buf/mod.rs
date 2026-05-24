@@ -5,7 +5,9 @@
 //! available so hot paths can reuse memory rather than allocate per operation.
 
 mod hugepage;
+mod iovec;
 mod pool;
 
 pub use hugepage::{HugeBuf, HugePageSize};
+pub use iovec::{IoVec, IoVecMut, RawIoVec};
 pub use pool::{BufPool, PooledBuf};

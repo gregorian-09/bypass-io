@@ -66,6 +66,32 @@ pub trait IoBackend: Send + Sync + 'static {
         offset: u64,
     ) -> BoxIoFuture<'a, usize, Self::Error>;
 
+    /// Read sequentially into `bufs` from `target` starting at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when submission fails, completion reports a
+    /// device error, or any target/buffer constraint is invalid for the backend.
+    fn readv<'a>(
+        &'a self,
+        target: DeviceTarget,
+        bufs: &'a mut [PooledBuf],
+        offset: u64,
+    ) -> BoxIoFuture<'a, usize, Self::Error>;
+
+    /// Write sequentially from `bufs` to `target` starting at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when submission fails, completion reports a
+    /// device error, or any target/buffer constraint is invalid for the backend.
+    fn writev<'a>(
+        &'a self,
+        target: DeviceTarget,
+        bufs: &'a [PooledBuf],
+        offset: u64,
+    ) -> BoxIoFuture<'a, usize, Self::Error>;
+
     /// Ensure previously submitted writes are durable when the backend supports
     /// persistence.
     ///
