@@ -153,7 +153,17 @@ impl<T> MpscRing<T> {
 
 impl<T> Drop for MpscRing<T> {
     fn drop(&mut self) {
-        while self.pop().is_some() {}
+        for slot in &mut self.slots {
+            if slot.ready.swap(false, Ordering::Acquire) {
+                // Safety: `ready == true` means a producer initialized this
+                // slot and published it with release ordering. During `drop`
+                // we have exclusive access to the ring, so no producer or
+                // consumer can concurrently access the slot.
+                unsafe {
+                    (*slot.value.get()).assume_init_drop();
+                }
+            }
+        }
     }
 }
 
@@ -228,5 +238,28 @@ mod tests {
         expected.sort_unstable();
 
         assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn drops_published_items() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountDrop(Arc<AtomicUsize>);
+
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let ring = MpscRing::new(4);
+            assert!(ring.push(CountDrop(Arc::clone(&drops))).is_ok());
+            assert!(ring.push(CountDrop(Arc::clone(&drops))).is_ok());
+        }
+
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
     }
 }
