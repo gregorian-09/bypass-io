@@ -1,0 +1,87 @@
+name: SPDK Native
+
+on:
+  workflow_dispatch:
+    inputs:
+      spdk_ref:
+        description: "SPDK branch, tag, or SHA to build"
+        required: true
+        default: "master"
+      build_jobs:
+        description: "Parallel make jobs for SPDK"
+        required: true
+        default: "2"
+      run_spdk_unit_tests:
+        description: "Run SPDK's own unit test suite after building"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spdk-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  spdk-native:
+    name: Build SPDK and validate Rust SPDK feature
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout bypass-io
+        uses: actions/checkout@v4
+
+      - name: Checkout SPDK
+        uses: actions/checkout@v4
+        with:
+          repository: spdk/spdk
+          ref: ${{ inputs.spdk_ref }}
+          path: _spdk
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Install SPDK build prerequisites
+        working-directory: _spdk
+        run: sudo ./scripts/pkgdep.sh
+
+      - name: Configure SPDK
+        working-directory: _spdk
+        run: ./configure
+
+      - name: Build SPDK
+        working-directory: _spdk
+        run: make -j"${{ inputs.build_jobs }}"
+
+      - name: Optionally run SPDK unit tests
+        if: ${{ inputs.run_spdk_unit_tests }}
+        working-directory: _spdk
+        run: ./test/unit/unittest.sh
+
+      - name: Validate bypass-io SPDK feature
+        run: cargo test --features spdk
+
+      - name: Validate all Rust features
+        run: cargo test --all-features
+
+      - name: Lint all Rust features
+        run: cargo clippy --all-targets --all-features -- -D warnings
