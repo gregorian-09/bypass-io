@@ -1,5 +1,5 @@
 [workspace]
-members = ["bypass-io"]
+members = ["bypass-io", "bypass-db"]
 resolver = "2"
 
 [workspace.package]
