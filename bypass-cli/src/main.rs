@@ -1,90 +1,114 @@
-use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bypass_db::{ColumnData, ColumnDef, DType, RowBatch, Schema, Table};
 use bypass_io::{BypassConfig, UringBackend};
+use clap::{Parser, Subcommand};
+use tracing::{info, warn};
 
 fn main() {
-    if let Err(err) = run(env::args().skip(1).collect()) {
+    let cli = Cli::parse();
+    init_tracing(cli.trace_json);
+    if let Err(err) = run(cli) {
         eprintln!("{err}");
         std::process::exit(err.exit_code());
     }
 }
 
-fn run(args: Vec<String>) -> Result<(), CliError> {
-    match args.first().map(String::as_str) {
-        Some("config") => run_config(&args[1..]),
-        Some("bench") => run_bench(&args[1..]),
-        Some("-h" | "--help") | None => {
-            print_help();
-            Ok(())
-        }
-        Some(other) => Err(CliError::Usage(format!("unknown command {other}"))),
+fn run(cli: Cli) -> Result<(), CliError> {
+    match cli.command {
+        Command::Config { command } => run_config(command),
+        Command::Bench { command } => run_bench(command),
     }
 }
 
-fn run_config(args: &[String]) -> Result<(), CliError> {
-    match args.first().map(String::as_str) {
-        Some("default") => {
-            let output = optional_value(args, "--output")?;
+fn run_config(command: ConfigCommand) -> Result<(), CliError> {
+    match command {
+        ConfigCommand::Default { output } => {
             let text = BypassConfig::default().to_toml_string();
             if let Some(path) = output {
-                fs::write(path, text).map_err(CliError::Io)?;
+                fs::write(&path, text).map_err(CliError::Io)?;
+                info!(
+                    event = "config_default_written",
+                    file = %path.display(),
+                    "wrote default configuration"
+                );
             } else {
                 print!("{text}");
+                info!(
+                    event = "config_default_printed",
+                    "printed default configuration"
+                );
             }
             Ok(())
         }
-        Some("validate") => {
-            let file = required_value(args, "--file")?;
+        ConfigCommand::Validate { file } => {
             BypassConfig::load(&file)?;
             println!("config_ok file={}", file.display());
+            info!(
+                event = "config_validated",
+                file = %file.display(),
+                "validated configuration"
+            );
             Ok(())
         }
-        Some("-h" | "--help") | None => {
-            print_config_help();
-            Ok(())
-        }
-        Some(other) => Err(CliError::Usage(format!("unknown config command {other}"))),
     }
 }
 
-fn run_bench(args: &[String]) -> Result<(), CliError> {
-    match args.first().map(String::as_str) {
-        Some("uring") => bench_uring(args),
-        Some("db") => bench_db(args),
-        Some("spdk") => Err(CliError::Unsupported(
-            "SPDK benchmarking requires the native SPDK runtime and hardware binding phase",
-        )),
-        Some("dpdk") => Err(CliError::Unsupported(
-            "DPDK benchmarking requires the native DPDK runtime and NIC binding phase",
-        )),
-        Some("-h" | "--help") | None => {
-            print_bench_help();
-            Ok(())
+fn run_bench(command: BenchCommand) -> Result<(), CliError> {
+    match command {
+        BenchCommand::Uring {
+            file,
+            buf_size,
+            depth,
+            duration,
+        } => bench_uring(file, buf_size, depth, duration),
+        BenchCommand::Db {
+            path,
+            rows_per_batch,
+            batches,
+        } => bench_db(path, rows_per_batch, batches),
+        BenchCommand::Spdk { pci, .. } => {
+            warn!(
+                event = "spdk_benchmark_unsupported",
+                pci = %pci,
+                "SPDK benchmark requested before native runtime support"
+            );
+            Err(CliError::Unsupported(
+                "SPDK benchmarking requires the native SPDK runtime and hardware binding phase",
+            ))
         }
-        Some(other) => Err(CliError::Usage(format!("unknown benchmark {other}"))),
+        BenchCommand::Dpdk { pci, .. } => {
+            warn!(
+                event = "dpdk_benchmark_unsupported",
+                pci = %pci,
+                "DPDK benchmark requested before native runtime support"
+            );
+            Err(CliError::Unsupported(
+                "DPDK benchmarking requires the native DPDK runtime and NIC binding phase",
+            ))
+        }
     }
 }
 
-fn bench_uring(args: &[String]) -> Result<(), CliError> {
-    let file = required_value(args, "--file")?;
-    let buf_size = parse_usize_arg(args, "--buf-size", 4096)?;
-    let _depth = parse_usize_arg(args, "--depth", 1)?;
-    let duration = parse_duration_arg(args, "--duration", Duration::from_secs(10))?;
+fn bench_uring(
+    file: PathBuf,
+    buf_size: usize,
+    _depth: usize,
+    duration: Duration,
+) -> Result<(), CliError> {
     let backend = UringBackend::new(256).map_err(CliError::Io)?;
     let file_handle = OpenOptions::new()
         .create(true)
         .truncate(true)
         .read(true)
         .write(true)
-        .open(file)
+        .open(&file)
         .map_err(CliError::Io)?;
     let buffer = vec![0x5a; buf_size];
     let started = Instant::now();
@@ -104,14 +128,23 @@ fn bench_uring(args: &[String]) -> Result<(), CliError> {
         .fsync(file_handle.as_raw_fd())
         .map_err(CliError::Io)?;
 
-    print_benchmark_result("uring_write", ops, bytes, started.elapsed());
+    let elapsed = started.elapsed();
+    info!(
+        event = "benchmark_complete",
+        benchmark = "uring_write",
+        file = %file.display(),
+        ops,
+        bytes,
+        elapsed_ms = elapsed.as_millis(),
+        ops_per_sec = rate(ops, elapsed),
+        mib_per_sec = mib_per_sec(bytes, elapsed),
+        "completed io_uring write benchmark"
+    );
+    print_benchmark_result("uring_write", ops, bytes, elapsed);
     Ok(())
 }
 
-fn bench_db(args: &[String]) -> Result<(), CliError> {
-    let path = required_value(args, "--path")?;
-    let rows_per_batch = parse_usize_arg(args, "--rows-per-batch", 10_000)?;
-    let batches = parse_usize_arg(args, "--batches", 1_000)?;
+fn bench_db(path: PathBuf, rows_per_batch: usize, batches: usize) -> Result<(), CliError> {
     let schema = Schema::new(
         "trades",
         vec![
@@ -121,7 +154,7 @@ fn bench_db(args: &[String]) -> Result<(), CliError> {
             ColumnDef::new("volume", DType::F64)?,
         ],
     )?;
-    let mut table = Table::open(path, schema.clone())?;
+    let mut table = Table::open(&path, schema.clone())?;
     let started = Instant::now();
     let mut total_rows = 0usize;
 
@@ -132,6 +165,16 @@ fn bench_db(args: &[String]) -> Result<(), CliError> {
     table.flush()?;
 
     let elapsed = started.elapsed();
+    info!(
+        event = "benchmark_complete",
+        benchmark = "db_append",
+        path = %path.display(),
+        rows = total_rows,
+        batches,
+        elapsed_ms = elapsed.as_millis(),
+        rows_per_sec = rate(total_rows, elapsed),
+        "completed bypass-db append benchmark"
+    );
     println!(
         "benchmark=db_append rows={} batches={} elapsed_ms={} rows_per_sec={:.2}",
         total_rows,
@@ -183,7 +226,7 @@ fn print_benchmark_result(name: &str, ops: usize, bytes: usize, elapsed: Duratio
         bytes,
         elapsed.as_millis(),
         rate(ops, elapsed),
-        bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON)
+        mib_per_sec(bytes, elapsed)
     );
 }
 
@@ -191,88 +234,142 @@ fn rate(units: usize, elapsed: Duration) -> f64 {
     units as f64 / elapsed.as_secs_f64().max(f64::EPSILON)
 }
 
-fn required_value(args: &[String], flag: &str) -> Result<PathBuf, CliError> {
-    optional_value(args, flag)?
-        .map(PathBuf::from)
-        .ok_or_else(|| CliError::Usage(format!("missing required {flag}")))
+fn mib_per_sec(bytes: usize, elapsed: Duration) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON)
 }
 
-fn optional_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, CliError> {
-    let Some(index) = args.iter().position(|arg| arg == flag) else {
-        return Ok(None);
-    };
-    args.get(index + 1)
-        .map(String::as_str)
-        .map(Some)
-        .ok_or_else(|| CliError::Usage(format!("missing value for {flag}")))
-}
-
-fn parse_usize_arg(args: &[String], flag: &str, default: usize) -> Result<usize, CliError> {
-    let Some(value) = optional_value(args, flag)? else {
-        return Ok(default);
-    };
-    value
-        .parse()
-        .map_err(|_| CliError::Usage(format!("{flag} must be an unsigned integer")))
-}
-
-fn parse_duration_arg(
-    args: &[String],
-    flag: &str,
-    default: Duration,
-) -> Result<Duration, CliError> {
-    let Some(value) = optional_value(args, flag)? else {
-        return Ok(default);
-    };
-    parse_duration(value).ok_or_else(|| {
-        CliError::Usage(format!(
-            "{flag} must be a duration like 500ms, 10s, 2m, or 1h"
-        ))
-    })
-}
-
-fn parse_duration(value: &str) -> Option<Duration> {
+fn parse_duration(value: &str) -> Result<Duration, String> {
     let split = value
         .find(|ch: char| !ch.is_ascii_digit())
         .unwrap_or(value.len());
     if split == 0 {
-        return None;
+        return Err("duration must start with a number".to_string());
     }
-    let count = value[..split].parse::<u64>().ok()?;
+    let count = value[..split]
+        .parse::<u64>()
+        .map_err(|_| "duration count must be an unsigned integer".to_string())?;
     match &value[split..] {
-        "ms" => Some(Duration::from_millis(count)),
-        "s" | "" => Some(Duration::from_secs(count)),
-        "m" => Some(Duration::from_secs(count.saturating_mul(60))),
-        "h" => Some(Duration::from_secs(count.saturating_mul(60 * 60))),
-        _ => None,
+        "ms" => Ok(Duration::from_millis(count)),
+        "s" | "" => Ok(Duration::from_secs(count)),
+        "m" => Ok(Duration::from_secs(count.saturating_mul(60))),
+        "h" => Ok(Duration::from_secs(count.saturating_mul(60 * 60))),
+        suffix => Err(format!("unsupported duration suffix {suffix:?}")),
     }
 }
 
-fn print_help() {
-    println!("usage:");
-    print_config_help();
-    print_bench_help();
+fn init_tracing(json: bool) {
+    if json {
+        tracing_subscriber::fmt().json().init();
+    }
 }
 
-fn print_config_help() {
-    println!("  bypass-cli config default [--output bypass-io.toml]");
-    println!("  bypass-cli config validate --file bypass-io.toml");
+/// `bypass-io` benchmark and configuration harness.
+#[derive(Debug, Parser)]
+#[command(name = "bypass-cli", version, about)]
+struct Cli {
+    /// Emit structured tracing events as JSON.
+    #[arg(long, global = true)]
+    trace_json: bool,
+    /// Command to run.
+    #[command(subcommand)]
+    command: Command,
 }
 
-fn print_bench_help() {
-    println!(
-        "  bypass-cli bench uring --file /tmp/test.bin [--buf-size 4096] [--depth 1] [--duration 10s]"
-    );
-    println!(
-        "  bypass-cli bench db --path /tmp/bypass-db [--rows-per-batch 10000] [--batches 1000]"
-    );
-    println!("  bypass-cli bench spdk --pci 0000:01:00.0");
-    println!("  bypass-cli bench dpdk --pci 0000:02:00.0");
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Generate or validate runtime configuration.
+    Config {
+        /// Configuration command.
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Run local benchmark harnesses.
+    Bench {
+        /// Benchmark command.
+        #[command(subcommand)]
+        command: BenchCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print or write a default `bypass-io.toml`.
+    Default {
+        /// Output file. Prints to stdout when omitted.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Validate a `bypass-io.toml` file.
+    Validate {
+        /// Configuration file path.
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BenchCommand {
+    /// Benchmark local `io_uring` write throughput.
+    Uring {
+        /// File to write.
+        #[arg(long)]
+        file: PathBuf,
+        /// Write buffer size in bytes.
+        #[arg(long, default_value_t = 4096)]
+        buf_size: usize,
+        /// Submission depth target for future async benchmark variants.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Benchmark duration, such as `500ms`, `10s`, `2m`, or `1h`.
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        duration: Duration,
+    },
+    /// Benchmark local `bypass-db` append throughput.
+    Db {
+        /// Table root path.
+        #[arg(long)]
+        path: PathBuf,
+        /// Rows per generated batch.
+        #[arg(long, default_value_t = 10_000)]
+        rows_per_batch: usize,
+        /// Number of batches to append.
+        #[arg(long, default_value_t = 1_000)]
+        batches: usize,
+    },
+    /// Placeholder for native SPDK benchmark support.
+    Spdk {
+        /// NVMe PCI BDF.
+        #[arg(long)]
+        pci: String,
+        /// Read/write mode.
+        #[arg(long, default_value = "write")]
+        rw: String,
+        /// Block size in bytes.
+        #[arg(long, default_value_t = 4096)]
+        block_size: usize,
+        /// Queue depth.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Benchmark duration.
+        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        duration: Duration,
+    },
+    /// Placeholder for native DPDK benchmark support.
+    Dpdk {
+        /// NIC PCI BDF.
+        #[arg(long)]
+        pci: String,
+        /// Packet mode.
+        #[arg(long, default_value = "rx")]
+        mode: String,
+        /// Benchmark duration.
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        duration: Duration,
+    },
 }
 
 #[derive(Debug)]
 enum CliError {
-    Usage(String),
     Unsupported(&'static str),
     Io(io::Error),
     Config(bypass_io::ConfigError),
@@ -284,7 +381,6 @@ enum CliError {
 impl CliError {
     fn exit_code(&self) -> i32 {
         match self {
-            Self::Usage(_) => 2,
             Self::Unsupported(_) => 3,
             Self::Io(_) | Self::Config(_) | Self::Schema(_) | Self::Batch(_) | Self::Table(_) => 1,
         }
@@ -294,7 +390,6 @@ impl CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage(message) => write!(f, "usage error: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported benchmark: {message}"),
             Self::Io(err) => write!(f, "{err}"),
             Self::Config(err) => write!(f, "{err}"),
@@ -337,11 +432,6 @@ impl From<bypass_db::table::TableError> for CliError {
     }
 }
 
-#[allow(dead_code)]
-fn path_exists(path: &Path) -> bool {
-    path.exists()
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -350,10 +440,10 @@ mod tests {
 
     #[test]
     fn parse_duration_supports_common_suffixes() {
-        assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
-        assert_eq!(parse_duration("10s"), Some(Duration::from_secs(10)));
-        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
-        assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_duration("bad"), None);
+        assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_duration("10s"), Ok(Duration::from_secs(10)));
+        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_duration("1h"), Ok(Duration::from_secs(3600)));
+        assert!(parse_duration("bad").is_err());
     }
 }

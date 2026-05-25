@@ -1,16 +1,22 @@
 //! Runtime configuration for `bypass-io`.
 //!
 //! The project specification describes a TOML configuration file named
-//! `bypass-io.toml`. This module provides the typed model and a small parser
-//! for that exact format without adding a third-party TOML dependency yet.
+//! `bypass-io.toml`. This module provides the typed model, serde-backed TOML
+//! parsing, deterministic TOML generation, and validation for invariants that
+//! can be checked before hardware-specific runtime setup begins.
 
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::de::{self, Deserializer};
+use serde::ser::{SerializeMap, Serializer};
+use serde::{Deserialize, Serialize};
+
 /// Complete runtime configuration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BypassConfig {
     /// Poll-reactor CPU configuration.
     pub reactor: ReactorConfig,
@@ -41,147 +47,20 @@ impl BypassConfig {
         Self::from_toml_str(&text)
     }
 
-    /// Parse the supported `bypass-io.toml` format.
+    /// Parse a `bypass-io.toml` string.
     ///
     /// # Errors
     ///
-    /// Returns an error when a value has the wrong shape, a required field is
-    /// missing, or validation fails.
+    /// Returns an error when TOML deserialization fails or validation rejects
+    /// the resulting values.
     pub fn from_toml_str(input: &str) -> Result<Self, ConfigError> {
-        let mut config = Self::default();
-        let mut section = Section::Root;
-        let mut saw_schema = false;
-        let mut reset_schema = false;
-
-        for (line_no, raw_line) in input.lines().enumerate() {
-            let line_no = line_no + 1;
-            let line = strip_comment(raw_line).trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            if line.starts_with('[') {
-                section = match line {
-                    "[reactor]" => Section::Reactor,
-                    "[bufpool]" => Section::BufPool,
-                    "[uring]" => Section::Uring,
-                    "[spdk]" => Section::Spdk,
-                    "[dpdk]" => Section::Dpdk,
-                    "[db]" => Section::Db,
-                    "[db.schema]" => {
-                        saw_schema = true;
-                        if !reset_schema {
-                            config.db.schema = DbSchemaConfig {
-                                name: String::new(),
-                                columns: Vec::new(),
-                            };
-                            reset_schema = true;
-                        }
-                        Section::DbSchema
-                    }
-                    "[[db.schema.columns]]" => {
-                        saw_schema = true;
-                        if !reset_schema {
-                            config.db.schema = DbSchemaConfig {
-                                name: String::new(),
-                                columns: Vec::new(),
-                            };
-                            reset_schema = true;
-                        }
-                        config.db.schema.columns.push(DbColumnConfig::default());
-                        Section::DbSchemaColumn(config.db.schema.columns.len() - 1)
-                    }
-                    _ => {
-                        return Err(ConfigError::Parse {
-                            line: line_no,
-                            message: format!("unsupported section {line}"),
-                        });
-                    }
-                };
-                continue;
-            }
-
-            let (key, value) = split_key_value(line, line_no)?;
-            match section {
-                Section::Root => {
-                    return Err(ConfigError::Parse {
-                        line: line_no,
-                        message: format!("key {key} is not inside a supported section"),
-                    });
-                }
-                Section::Reactor => match key {
-                    "poll_cores" => config.reactor.poll_cores = parse_u32_array(value, line_no)?,
-                    _ => unknown_key(key, line_no)?,
-                },
-                Section::BufPool => match key {
-                    "count" => config.bufpool.count = parse_usize(value, line_no)?,
-                    "buf_size_mib" => config.bufpool.buf_size_mib = parse_usize(value, line_no)?,
-                    _ => unknown_key(key, line_no)?,
-                },
-                Section::Uring => match key {
-                    "sq_depth" => config.uring.sq_depth = parse_u32(value, line_no)?,
-                    "cq_depth" => config.uring.cq_depth = parse_u32(value, line_no)?,
-                    "sqpoll_idle_ms" => {
-                        config.uring.sqpoll_idle_ms = parse_u32(value, line_no)?;
-                    }
-                    _ => unknown_key(key, line_no)?,
-                },
-                Section::Spdk => match key {
-                    "devices" => config.spdk.devices = parse_string_array(value, line_no)?,
-                    "queue_depth" => config.spdk.queue_depth = parse_u32(value, line_no)?,
-                    "io_size_mib" => config.spdk.io_size_mib = parse_usize(value, line_no)?,
-                    _ => unknown_key(key, line_no)?,
-                },
-                Section::Dpdk => match key {
-                    "pci_addr" => config.dpdk.pci_addr = parse_string(value, line_no)?,
-                    "rx_queues" => config.dpdk.rx_queues = parse_u16(value, line_no)?,
-                    "tx_queues" => config.dpdk.tx_queues = parse_u16(value, line_no)?,
-                    "rss_key" => config.dpdk.rss_key = parse_string(value, line_no)?,
-                    _ => unknown_key(key, line_no)?,
-                },
-                Section::Db => match key {
-                    "path" => config.db.path = parse_string(value, line_no)?,
-                    "wal_size_mib" => config.db.wal_size_mib = parse_usize(value, line_no)?,
-                    "segment_rows" => config.db.segment_rows = parse_usize(value, line_no)?,
-                    "compaction_threads" => {
-                        config.db.compaction_threads = parse_usize(value, line_no)?;
-                    }
-                    _ => unknown_key(key, line_no)?,
-                },
-                Section::DbSchema => match key {
-                    "name" => config.db.schema.name = parse_string(value, line_no)?,
-                    _ => unknown_key(key, line_no)?,
-                },
-                Section::DbSchemaColumn(index) => {
-                    let column =
-                        config
-                            .db
-                            .schema
-                            .columns
-                            .get_mut(index)
-                            .ok_or(ConfigError::Parse {
-                                line: line_no,
-                                message: "column section missing backing storage".to_string(),
-                            })?;
-                    match key {
-                        "name" => column.name = parse_string(value, line_no)?,
-                        "dtype" => column.dtype = parse_dtype(value, line_no)?,
-                        _ => unknown_key(key, line_no)?,
-                    }
-                }
-            }
-        }
-
-        if !saw_schema {
-            return Err(ConfigError::Validation(
-                "missing [db.schema] section".to_string(),
-            ));
-        }
+        let config: Self =
+            toml::from_str(input).map_err(|source| ConfigError::Deserialize(source.to_string()))?;
         config.validate()?;
         Ok(config)
     }
 
-    /// Serialize the configuration to deterministic TOML.
+    /// Serialize the configuration to deterministic spec-shaped TOML.
     #[must_use]
     pub fn to_toml_string(&self) -> String {
         let mut out = String::new();
@@ -225,7 +104,7 @@ impl BypassConfig {
         for column in &self.db.schema.columns {
             out.push_str("\n[[db.schema.columns]]\n");
             out.push_str(&format!("name = {:?}\n", column.name));
-            out.push_str(&format!("dtype = {}\n", column.dtype));
+            out.push_str(&format!("dtype = {}\n", column.dtype.to_toml_value()));
         }
         out
     }
@@ -278,7 +157,8 @@ impl BypassConfig {
 }
 
 /// Poll-reactor CPU configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReactorConfig {
     /// CPU ids dedicated to polling.
     pub poll_cores: Vec<u32>,
@@ -293,7 +173,8 @@ impl Default for ReactorConfig {
 }
 
 /// Huge-page buffer-pool configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BufPoolConfig {
     /// Number of buffers to pre-allocate.
     pub count: usize,
@@ -311,7 +192,8 @@ impl Default for BufPoolConfig {
 }
 
 /// `io_uring` runtime configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UringConfig {
     /// Submission queue depth.
     pub sq_depth: u32,
@@ -332,7 +214,8 @@ impl Default for UringConfig {
 }
 
 /// SPDK runtime configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpdkRuntimeConfig {
     /// PCI BDFs for NVMe devices.
     pub devices: Vec<String>,
@@ -353,7 +236,8 @@ impl Default for SpdkRuntimeConfig {
 }
 
 /// DPDK runtime configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DpdkRuntimeConfig {
     /// PCI BDF for the NIC.
     pub pci_addr: String,
@@ -377,7 +261,8 @@ impl Default for DpdkRuntimeConfig {
 }
 
 /// Embedded database configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DbConfig {
     /// Table root path.
     pub path: String,
@@ -404,7 +289,8 @@ impl Default for DbConfig {
 }
 
 /// Database schema configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DbSchemaConfig {
     /// Table name.
     pub name: String,
@@ -477,21 +363,13 @@ impl Default for DbSchemaConfig {
 }
 
 /// Database column configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DbColumnConfig {
     /// Column name.
     pub name: String,
     /// Column type.
     pub dtype: DbColumnDType,
-}
-
-impl Default for DbColumnConfig {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            dtype: DbColumnDType::F64,
-        }
-    }
 }
 
 /// Database column type used by [`DbColumnConfig`].
@@ -507,13 +385,59 @@ pub enum DbColumnDType {
     FixedStr(usize),
 }
 
-impl fmt::Display for DbColumnDType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Serialize for DbColumnDType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
         match self {
-            Self::F64 => write!(f, "{:?}", "F64"),
-            Self::I64 => write!(f, "{:?}", "I64"),
-            Self::Timestamp => write!(f, "{:?}", "Timestamp"),
-            Self::FixedStr(width) => write!(f, "{{ FixedStr = {width} }}"),
+            Self::F64 => serializer.serialize_str("F64"),
+            Self::I64 => serializer.serialize_str("I64"),
+            Self::Timestamp => serializer.serialize_str("Timestamp"),
+            Self::FixedStr(width) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("FixedStr", width)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DbColumnDType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            FixedStr {
+                #[serde(rename = "FixedStr")]
+                fixed_str: usize,
+            },
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Name(name) if name == "F64" => Ok(Self::F64),
+            Repr::Name(name) if name == "I64" => Ok(Self::I64),
+            Repr::Name(name) if name == "Timestamp" => Ok(Self::Timestamp),
+            Repr::Name(name) => Err(de::Error::unknown_variant(
+                &name,
+                &["F64", "I64", "Timestamp", "FixedStr"],
+            )),
+            Repr::FixedStr { fixed_str } => Ok(Self::FixedStr(fixed_str)),
+        }
+    }
+}
+
+impl DbColumnDType {
+    fn to_toml_value(&self) -> String {
+        match self {
+            Self::F64 => format!("{:?}", "F64"),
+            Self::I64 => format!("{:?}", "I64"),
+            Self::Timestamp => format!("{:?}", "Timestamp"),
+            Self::FixedStr(width) => format!("{{ FixedStr = {width} }}"),
         }
     }
 }
@@ -528,13 +452,10 @@ pub enum ConfigError {
         /// Source error message.
         message: String,
     },
-    /// Parsing failed.
-    Parse {
-        /// 1-based line number.
-        line: usize,
-        /// Error message.
-        message: String,
-    },
+    /// TOML deserialization failed.
+    Deserialize(String),
+    /// TOML serialization failed.
+    Serialize(String),
     /// Validation failed.
     Validation(String),
 }
@@ -545,141 +466,14 @@ impl fmt::Display for ConfigError {
             Self::Io { path, message } => {
                 write!(f, "failed to read {}: {message}", path.display())
             }
-            Self::Parse { line, message } => {
-                write!(f, "config parse error at line {line}: {message}")
-            }
+            Self::Deserialize(message) => write!(f, "config TOML parse error: {message}"),
+            Self::Serialize(message) => write!(f, "config TOML serialization error: {message}"),
             Self::Validation(message) => write!(f, "config validation error: {message}"),
         }
     }
 }
 
 impl Error for ConfigError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Section {
-    Root,
-    Reactor,
-    BufPool,
-    Uring,
-    Spdk,
-    Dpdk,
-    Db,
-    DbSchema,
-    DbSchemaColumn(usize),
-}
-
-fn strip_comment(line: &str) -> &str {
-    let mut in_string = false;
-    for (idx, byte) in line.bytes().enumerate() {
-        match byte {
-            b'"' => in_string = !in_string,
-            b'#' if !in_string => return &line[..idx],
-            _ => {}
-        }
-    }
-    line
-}
-
-fn split_key_value(line: &str, line_no: usize) -> Result<(&str, &str), ConfigError> {
-    let Some((key, value)) = line.split_once('=') else {
-        return Err(ConfigError::Parse {
-            line: line_no,
-            message: "expected key = value".to_string(),
-        });
-    };
-    Ok((key.trim(), value.trim()))
-}
-
-fn parse_usize(value: &str, line: usize) -> Result<usize, ConfigError> {
-    value.parse().map_err(|_| ConfigError::Parse {
-        line,
-        message: format!("expected unsigned integer, got {value}"),
-    })
-}
-
-fn parse_u32(value: &str, line: usize) -> Result<u32, ConfigError> {
-    value.parse().map_err(|_| ConfigError::Parse {
-        line,
-        message: format!("expected u32, got {value}"),
-    })
-}
-
-fn parse_u16(value: &str, line: usize) -> Result<u16, ConfigError> {
-    value.parse().map_err(|_| ConfigError::Parse {
-        line,
-        message: format!("expected u16, got {value}"),
-    })
-}
-
-fn parse_string(value: &str, line: usize) -> Result<String, ConfigError> {
-    let value = value.trim();
-    if !(value.starts_with('"') && value.ends_with('"')) || value.len() < 2 {
-        return Err(ConfigError::Parse {
-            line,
-            message: format!("expected quoted string, got {value}"),
-        });
-    }
-    Ok(value[1..value.len() - 1].to_string())
-}
-
-fn parse_u32_array(value: &str, line: usize) -> Result<Vec<u32>, ConfigError> {
-    parse_array_items(value, line)?
-        .into_iter()
-        .map(|item| parse_u32(item, line))
-        .collect()
-}
-
-fn parse_string_array(value: &str, line: usize) -> Result<Vec<String>, ConfigError> {
-    parse_array_items(value, line)?
-        .into_iter()
-        .map(|item| parse_string(item, line))
-        .collect()
-}
-
-fn parse_array_items(value: &str, line: usize) -> Result<Vec<&str>, ConfigError> {
-    let value = value.trim();
-    if !(value.starts_with('[') && value.ends_with(']')) {
-        return Err(ConfigError::Parse {
-            line,
-            message: format!("expected array, got {value}"),
-        });
-    }
-    let inner = value[1..value.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(inner.split(',').map(str::trim).collect())
-}
-
-fn parse_dtype(value: &str, line: usize) -> Result<DbColumnDType, ConfigError> {
-    match value.trim() {
-        "\"F64\"" => Ok(DbColumnDType::F64),
-        "\"I64\"" => Ok(DbColumnDType::I64),
-        "\"Timestamp\"" => Ok(DbColumnDType::Timestamp),
-        other if other.starts_with("{") && other.ends_with("}") => {
-            let inner = other[1..other.len() - 1].trim();
-            let (key, value) = split_key_value(inner, line)?;
-            if key != "FixedStr" {
-                return Err(ConfigError::Parse {
-                    line,
-                    message: format!("unsupported dtype table key {key}"),
-                });
-            }
-            Ok(DbColumnDType::FixedStr(parse_usize(value, line)?))
-        }
-        other => Err(ConfigError::Parse {
-            line,
-            message: format!("unsupported dtype {other}"),
-        }),
-    }
-}
-
-fn unknown_key<T>(key: &str, line: usize) -> Result<T, ConfigError> {
-    Err(ConfigError::Parse {
-        line,
-        message: format!("unsupported key {key}"),
-    })
-}
 
 fn validation<T>(message: &str) -> Result<T, ConfigError> {
     Err(ConfigError::Validation(message.to_string()))
