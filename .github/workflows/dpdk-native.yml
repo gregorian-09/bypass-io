@@ -1,0 +1,93 @@
+name: DPDK Native
+
+on:
+  workflow_dispatch:
+    inputs:
+      dpdk_ref:
+        description: "DPDK branch, tag, or SHA to build"
+        required: true
+        default: "main"
+      build_jobs:
+        description: "Parallel ninja jobs for DPDK"
+        required: true
+        default: "2"
+      run_dpdk_tests:
+        description: "Run DPDK's fast test suite after building"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dpdk-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dpdk-native:
+    name: Build DPDK and validate Rust DPDK feature
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout bypass-io
+        uses: actions/checkout@v4
+
+      - name: Checkout DPDK
+        uses: actions/checkout@v4
+        with:
+          repository: DPDK/dpdk
+          ref: ${{ inputs.dpdk_ref }}
+          path: _dpdk
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Install DPDK build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libnuma-dev \
+            meson \
+            ninja-build \
+            pkg-config \
+            python3-pyelftools
+
+      - name: Configure DPDK
+        working-directory: _dpdk
+        run: meson setup build
+
+      - name: Build DPDK
+        working-directory: _dpdk
+        run: ninja -C build -j"${{ inputs.build_jobs }}"
+
+      - name: Optionally run DPDK fast tests
+        if: ${{ inputs.run_dpdk_tests }}
+        working-directory: _dpdk
+        run: meson test -C build --suite fast-tests --print-errorlogs
+
+      - name: Validate bypass-io DPDK feature
+        run: cargo test --features dpdk
+
+      - name: Validate all Rust features
+        run: cargo test --all-features
+
+      - name: Lint all Rust features
+        run: cargo clippy --all-targets --all-features -- -D warnings

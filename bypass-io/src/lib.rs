@@ -3,11 +3,16 @@
 
 pub mod backend;
 pub mod buf;
-#[cfg(feature = "spdk")]
+#[cfg(any(feature = "dpdk", feature = "spdk"))]
 pub mod ffi;
 pub mod reactor;
 pub mod ring;
 
+#[cfg(feature = "dpdk")]
+pub use backend::dpdk::{
+    DpdkBackend, DpdkConfig, DpdkError, DpdkPortConfig, EtherType, EthernetHeader, Ipv4Header,
+    MulticastGroup, Packet, QueueId, UdpHeader,
+};
 #[cfg(feature = "spdk")]
 pub use backend::spdk::{
     IoQueuePair, NvmeController, NvmeLbaRange, NvmeNamespace, SpdkBackend, SpdkError,
