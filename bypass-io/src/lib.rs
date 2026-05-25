@@ -3,6 +3,7 @@
 
 pub mod backend;
 pub mod buf;
+pub mod config;
 #[cfg(any(feature = "dpdk", feature = "spdk"))]
 pub mod ffi;
 pub mod reactor;
@@ -22,6 +23,10 @@ pub use backend::uring::UringBackend;
 pub use backend::{BoxIoFuture, DeviceTarget, IoBackend};
 pub use buf::{
     BufPool, HugeBuf, HugeBufBacking, HugePageSize, IoVec, IoVecMut, PooledBuf, RawIoVec,
+};
+pub use config::{
+    BufPoolConfig, BypassConfig, ConfigError, DbColumnConfig, DbConfig, DbSchemaConfig,
+    DpdkRuntimeConfig, ReactorConfig, SpdkRuntimeConfig, UringConfig,
 };
 pub use reactor::{PollReactor, ReactorHandle};
 pub use ring::{MpscRing, SpscRing};
