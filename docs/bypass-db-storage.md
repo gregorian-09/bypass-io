@@ -53,6 +53,20 @@ column file metadata.
 The manifest is the table's durable index of sealed data. Segment directories
 not listed in the manifest are not part of the table.
 
+## Compaction
+
+`Table::compact` merges selected sealed segment ids into one new sealed segment.
+The selected segments are read in manifest order, appended into one replacement
+batch, and written as a new `segments/seg-NNNNNN/` directory.
+
+After the replacement segment is written, `manifest.json` is updated so the new
+segment occupies the first selected segment's position. The old segment
+directories are then removed. This preserves scan order while reducing the
+number of sealed segment files a query must inspect.
+
+Active rows are not included in compaction. Call `Table::flush` first when
+current active rows should be sealed before compaction.
+
 ## Current Boundary
 
 This phase reads sealed column files back into owned `RowBatch` values. It does

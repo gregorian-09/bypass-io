@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -187,6 +188,85 @@ impl Table {
             .iter()
             .map(|payload| decode_batch(&self.schema, payload))
             .collect()
+    }
+
+    /// Compact sealed segments into one replacement segment.
+    ///
+    /// Segment ids are compacted in manifest order. Active rows are not
+    /// included; callers should call [`Table::flush`] first when they need all
+    /// current rows sealed before compaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an id is unknown, a segment cannot be read, the
+    /// replacement segment cannot be written, or the manifest cannot be stored.
+    pub fn compact(&mut self, segment_ids: &[u64]) -> Result<(), TableError> {
+        if segment_ids.is_empty() {
+            return Ok(());
+        }
+
+        let requested = segment_ids.iter().copied().collect::<BTreeSet<_>>();
+        let present = self
+            .sealed
+            .iter()
+            .filter_map(|segment| requested.contains(&segment.id()).then_some(segment.id()))
+            .collect::<BTreeSet<_>>();
+        let missing = requested.difference(&present).copied().collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(TableError::Segment(format!(
+                "cannot compact unknown segment ids {missing:?}"
+            )));
+        }
+
+        let mut combined = RowBatch::empty(&self.schema);
+        let mut first_selected_index = None;
+        let mut old_paths = Vec::new();
+        for (idx, segment) in self.sealed.iter().enumerate() {
+            if requested.contains(&segment.id()) {
+                first_selected_index.get_or_insert(idx);
+                combined.append(&segment.read_batch(&self.schema)?)?;
+                old_paths.push(segment.path().to_path_buf());
+            }
+        }
+
+        if combined.row_count() == 0 {
+            return Ok(());
+        }
+
+        let replacement_id = self.manifest.next_segment_id;
+        let replacement = seal_batch(&self.path, &self.schema, replacement_id, &combined)?;
+        self.manifest.next_segment_id = self
+            .manifest
+            .next_segment_id
+            .checked_add(1)
+            .ok_or_else(|| TableError::Manifest("segment id overflow".to_string()))?;
+
+        let insert_at = first_selected_index.expect("requested ids were present");
+        let mut replacement_slot = Some(replacement);
+        let mut new_sealed = Vec::with_capacity(self.sealed.len() - requested.len() + 1);
+        for (idx, segment) in self.sealed.iter().cloned().enumerate() {
+            if idx == insert_at {
+                new_sealed.push(
+                    replacement_slot
+                        .take()
+                        .expect("replacement inserted exactly once"),
+                );
+            }
+            if !requested.contains(&segment.id()) {
+                new_sealed.push(segment);
+            }
+        }
+
+        self.manifest.sealed_segments = new_sealed.iter().map(segment_ref).collect();
+        self.manifest.store(&self.path)?;
+        self.sealed = new_sealed;
+
+        for old_path in old_paths {
+            if old_path.exists() {
+                fs::remove_dir_all(old_path).map_err(|err| TableError::Io(err.to_string()))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -560,6 +640,15 @@ mod tests {
             .unwrap()
     }
 
+    fn custom_batch(schema: &Schema, timestamp: i64, price: f64, volume: i64) -> RowBatch {
+        RowBatch::builder(schema)
+            .column("timestamp", ColumnData::Timestamp(vec![timestamp]))
+            .column("price", ColumnData::F64(vec![price]))
+            .column("volume", ColumnData::I64(vec![volume]))
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn table_appends_wal_records_and_scans_time_range() {
         let path = table_path("scan");
@@ -647,6 +736,63 @@ mod tests {
             result.column("price").unwrap().as_f64().unwrap(),
             &[4.0, 5.0]
         );
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn compact_replaces_selected_segments_and_preserves_scans_after_reopen() {
+        let path = table_path("compact");
+        let schema = schema();
+        let mut table = Table::open(&path, schema.clone()).unwrap();
+
+        table.append(&custom_batch(&schema, 10, 1.0, 100)).unwrap();
+        table.flush().unwrap();
+        table.append(&custom_batch(&schema, 20, 2.0, 200)).unwrap();
+        table.flush().unwrap();
+
+        assert_eq!(table.sealed_segment_count(), 2);
+        assert!(path.join("segments").join("seg-000001").exists());
+        assert!(path.join("segments").join("seg-000002").exists());
+
+        table.compact(&[1, 2]).unwrap();
+        assert_eq!(table.sealed_segment_count(), 1);
+        assert_eq!(table.manifest().sealed_segments[0].id, 3);
+        assert_eq!(table.manifest().next_segment_id, 4);
+        assert!(!path.join("segments").join("seg-000001").exists());
+        assert!(!path.join("segments").join("seg-000002").exists());
+        assert!(path.join("segments").join("seg-000003").exists());
+
+        let result = table.scan_time_range(0, 30).unwrap();
+        assert_eq!(result.row_count(), 2);
+        assert_eq!(
+            result.column("price").unwrap().as_f64().unwrap(),
+            &[1.0, 2.0]
+        );
+
+        drop(table);
+        let reopened = Table::open(&path, schema).unwrap();
+        assert_eq!(reopened.sealed_segment_count(), 1);
+        let result = reopened.scan_time_range(0, 30).unwrap();
+        assert_eq!(result.row_count(), 2);
+        assert_eq!(
+            result.column("volume").unwrap().as_i64().unwrap(),
+            &[100, 200]
+        );
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn compact_rejects_unknown_segment_ids() {
+        let path = table_path("compact-missing");
+        let schema = schema();
+        let mut table = Table::open(&path, schema.clone()).unwrap();
+        table.append(&custom_batch(&schema, 10, 1.0, 100)).unwrap();
+        table.flush().unwrap();
+
+        let err = table.compact(&[99]).unwrap_err();
+        assert!(err.to_string().contains("unknown segment ids"));
 
         fs::remove_dir_all(path).unwrap();
     }

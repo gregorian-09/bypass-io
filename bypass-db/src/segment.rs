@@ -153,6 +153,18 @@ impl ImmutableSegment {
         &self.meta
     }
 
+    /// Segment id.
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.meta.id
+    }
+
+    /// Segment directory path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Return true if this segment can contain timestamps in `[start, end)`.
     #[must_use]
     pub fn overlaps_time_range(&self, start: i64, end: i64) -> bool {
