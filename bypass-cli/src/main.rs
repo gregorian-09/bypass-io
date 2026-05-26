@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use bypass_db::{ColumnData, ColumnDef, DType, RowBatch, Schema, Table};
+use bypass_db::{ColumnData, ColumnDef, DType, RangePredicate, RowBatch, Schema, Table};
 use bypass_io::{BypassConfig, UringBackend};
 use clap::{Parser, Subcommand};
 use tracing::{info, warn};
@@ -72,7 +72,9 @@ fn run_bench(command: BenchCommand) -> Result<(), CliError> {
             path,
             rows_per_batch,
             batches,
-        } => bench_db(path, rows_per_batch, batches),
+            scan_iterations,
+            compact,
+        } => bench_db(path, rows_per_batch, batches, scan_iterations, compact),
         BenchCommand::Spdk { pci, .. } => {
             warn!(
                 event = "spdk_benchmark_unsupported",
@@ -144,7 +146,13 @@ fn bench_uring(
     Ok(())
 }
 
-fn bench_db(path: PathBuf, rows_per_batch: usize, batches: usize) -> Result<(), CliError> {
+fn bench_db(
+    path: PathBuf,
+    rows_per_batch: usize,
+    batches: usize,
+    scan_iterations: usize,
+    compact: bool,
+) -> Result<(), CliError> {
     let schema = Schema::new(
         "trades",
         vec![
@@ -182,6 +190,82 @@ fn bench_db(path: PathBuf, rows_per_batch: usize, batches: usize) -> Result<(), 
         elapsed.as_millis(),
         rate(total_rows, elapsed)
     );
+
+    let scan_start = Instant::now();
+    let mut scanned_rows = 0usize;
+    for _ in 0..scan_iterations {
+        let result = table.scan_time_range(0, total_rows as i64)?;
+        scanned_rows = scanned_rows.saturating_add(result.row_count());
+    }
+    let scan_elapsed = scan_start.elapsed();
+    info!(
+        event = "benchmark_complete",
+        benchmark = "db_scan_time_range",
+        path = %path.display(),
+        rows = scanned_rows,
+        iterations = scan_iterations,
+        elapsed_ms = scan_elapsed.as_millis(),
+        rows_per_sec = rate(scanned_rows, scan_elapsed),
+        "completed bypass-db mmap time-range scan benchmark"
+    );
+    println!(
+        "benchmark=db_scan_time_range rows={} iterations={} elapsed_ms={} rows_per_sec={:.2}",
+        scanned_rows,
+        scan_iterations,
+        scan_elapsed.as_millis(),
+        rate(scanned_rows, scan_elapsed)
+    );
+
+    let predicate = RangePredicate::new("price", 100.0, 110.0);
+    let predicate_start = Instant::now();
+    let mut predicate_rows = 0usize;
+    for _ in 0..scan_iterations {
+        let result = table.scan_where((0, total_rows as i64), &predicate)?;
+        predicate_rows = predicate_rows.saturating_add(result.row_count());
+    }
+    let predicate_elapsed = predicate_start.elapsed();
+    info!(
+        event = "benchmark_complete",
+        benchmark = "db_scan_predicate",
+        path = %path.display(),
+        rows = predicate_rows,
+        iterations = scan_iterations,
+        elapsed_ms = predicate_elapsed.as_millis(),
+        rows_per_sec = rate(predicate_rows, predicate_elapsed),
+        "completed bypass-db predicate scan benchmark"
+    );
+    println!(
+        "benchmark=db_scan_predicate rows={} iterations={} elapsed_ms={} rows_per_sec={:.2}",
+        predicate_rows,
+        scan_iterations,
+        predicate_elapsed.as_millis(),
+        rate(predicate_rows, predicate_elapsed)
+    );
+
+    if compact {
+        let segment_ids = table
+            .manifest()
+            .sealed_segments
+            .iter()
+            .map(|segment| segment.id)
+            .collect::<Vec<_>>();
+        let compact_start = Instant::now();
+        table.compact(&segment_ids)?;
+        let compact_elapsed = compact_start.elapsed();
+        info!(
+            event = "benchmark_complete",
+            benchmark = "db_compact",
+            path = %path.display(),
+            segments = segment_ids.len(),
+            elapsed_ms = compact_elapsed.as_millis(),
+            "completed bypass-db compaction benchmark"
+        );
+        println!(
+            "benchmark=db_compact segments={} elapsed_ms={}",
+            segment_ids.len(),
+            compact_elapsed.as_millis()
+        );
+    }
     Ok(())
 }
 
@@ -335,6 +419,12 @@ enum BenchCommand {
         /// Number of batches to append.
         #[arg(long, default_value_t = 1_000)]
         batches: usize,
+        /// Number of scan and predicate-scan iterations after append/flush.
+        #[arg(long, default_value_t = 10)]
+        scan_iterations: usize,
+        /// Benchmark segment compaction after scan benchmarks.
+        #[arg(long)]
+        compact: bool,
     },
     /// Placeholder for native SPDK benchmark support.
     Spdk {

@@ -82,9 +82,37 @@ mapped bytes on demand. They intentionally do not expose typed slices such as
 `&[f64]`, because file mappings are byte-addressed and safe typed slices require
 additional alignment and aliasing proof.
 
+## Scan Results
+
+`Table::scan_time_range` now keeps sealed segment columns mmap-backed in the
+returned `ScanResult`. A result column is chunked:
+
+- sealed chunks reference a `MappedColumn` plus selected row indices
+- active mutable rows remain owned chunks
+
+This avoids reading every selected sealed column into an owned `RowBatch` before
+returning scan data. Callers that need contiguous vectors can use
+`ScanColumn::f64_values`, `ScanColumn::i64_values`,
+`ScanColumn::timestamp_values`, or `ScanColumn::fixed_str_values`.
+
+`ScanColumn::as_f64`, `ScanColumn::as_i64`, and
+`ScanColumn::as_timestamps` still return borrowed slices only for single owned
+chunks. They return `None` for mmap-backed or multi-chunk columns because there
+is no single contiguous borrowed Rust slice for those results.
+
+## SIMD Scan Kernels
+
+Time-range filtering on sealed timestamp columns runs over validated mmap bytes.
+On little-endian `x86_64` with AVX2, the scan uses a 4-lane `i64` SIMD kernel.
+Other targets fall back to the same checked scalar comparison.
+
+`RangePredicate` filtering on `F64` columns uses a 4-lane AVX kernel on
+little-endian `x86_64` with AVX support. Other targets fall back to scalar
+filtering. The SIMD paths are runtime feature-detected before use.
+
 ## Current Boundary
 
-`Table::scan_time_range` still materializes sealed rows into owned `RowBatch`
-values before building `ScanResult`. The lower-level sealed segment API now has
-mmap-backed column access, so a future scan phase can keep selected scan columns
-backed by mappings instead of eagerly copying whole column files.
+The high-level scan path now keeps sealed segment results mmap-backed, but it
+still stores selected row indices separately from the mapped bytes. Future work
+can add range-compressed selections, typed-slice proofs for aligned full-column
+reads, and broader SIMD kernels for additional predicate shapes.

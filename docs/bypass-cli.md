@@ -38,7 +38,21 @@ Run a local `bypass-db` append benchmark:
 cargo run --release -p bypass-cli -- bench db \
   --path /tmp/bypass-db \
   --rows-per-batch 10000 \
-  --batches 1000
+  --batches 1000 \
+  --scan-iterations 10
+```
+
+The database benchmark now reports append throughput, mmap-backed time-range
+scan throughput, and predicate scan throughput. Add `--compact` to time segment
+compaction after the scan measurements:
+
+```bash
+cargo run --release -p bypass-cli -- bench db \
+  --path /tmp/bypass-db \
+  --rows-per-batch 10000 \
+  --batches 1000 \
+  --scan-iterations 10 \
+  --compact
 ```
 
 `bench spdk` and `bench dpdk` currently return explicit unsupported errors.

@@ -2,9 +2,7 @@
 
 `bypass-db` is the embedded columnar time-series layer for `bypass-io`.
 
-This phase implements the stable Rust data model first: schemas, columnar row
-batches, append-only table state, scalar scans, predicates, and a checksummed
-write-ahead log format. The implementation is intentionally small and
-self-contained so higher-performance mmap, SIMD, and native backend persistence
-can be added on top of verified semantics.
-
+The crate includes schemas, columnar row batches, append-only table state,
+predicates, a checksummed write-ahead log format, immutable sealed segments,
+mmap-backed scan chunks for sealed columns, segment compaction, and SIMD-assisted
+range filtering where the current CPU supports the required vector extension.

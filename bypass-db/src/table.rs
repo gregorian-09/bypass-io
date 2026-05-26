@@ -3,9 +3,12 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::batch::{BatchError, ColumnData, RowBatch};
-use crate::scan::{filter_indices, ColumnPredicate, ScanError, ScanResult};
+use crate::scan::{
+    filter_scan_indices, range_filter_i64_mapped, ColumnPredicate, ScanError, ScanResult,
+};
 use crate::schema::Schema;
 use crate::segment::{seal_batch, segment_ref, ImmutableSegment, Manifest};
 use crate::wal::{WalError, WalReader, WalWriter};
@@ -107,20 +110,32 @@ impl Table {
     /// Returns an error when the schema timestamp column is missing from active
     /// data.
     pub fn scan_time_range(&self, start: i64, end: i64) -> Result<ScanResult, TableError> {
-        let mut output = RowBatch::empty(&self.schema);
+        let mut output = ScanResult::empty(&self.schema);
+        let timestamp_column = self.schema.timestamp_column();
         for segment in &self.sealed {
             if !segment.overlaps_time_range(start, end) {
                 continue;
             }
-            output.append(&filter_time_batch(
-                &self.schema,
-                &segment.read_batch(&self.schema)?,
-                start,
-                end,
-            )?)?;
+            let timestamp_map =
+                Arc::new(segment.map_column(timestamp_column.name(), timestamp_column.dtype())?);
+            let indices = range_filter_i64_mapped(&timestamp_map, start, end)?;
+            if indices.is_empty() {
+                continue;
+            }
+            let indices = Arc::<[usize]>::from(indices);
+            let mut columns = Vec::with_capacity(self.schema.columns().len());
+            for column in self.schema.columns() {
+                let mapped = if column.name() == timestamp_column.name() {
+                    Arc::clone(&timestamp_map)
+                } else {
+                    Arc::new(segment.map_column(column.name(), column.dtype())?)
+                };
+                columns.push((column.name().to_string(), mapped));
+            }
+            output.append_mapped_columns(columns, indices)?;
         }
-        output.append(&filter_time_batch(&self.schema, &self.active, start, end)?)?;
-        Ok(ScanResult::from_batch(&output))
+        output.append_batch(&filter_time_batch(&self.schema, &self.active, start, end)?)?;
+        Ok(output)
     }
 
     /// Scan a time range with an additional column predicate.
@@ -134,9 +149,8 @@ impl Table {
         predicate: &dyn ColumnPredicate,
     ) -> Result<ScanResult, TableError> {
         let time_result = self.scan_time_range(time_range.0, time_range.1)?;
-        let batch = scan_result_to_batch(&time_result);
-        let indices = filter_indices(&batch, predicate)?;
-        Ok(ScanResult::from_batch(&batch.take_indices(&indices)))
+        let indices = filter_scan_indices(&time_result, predicate)?;
+        Ok(time_result.take_indices(&indices))
     }
 
     /// Flush the WAL and seal active rows to an immutable segment.
@@ -446,28 +460,6 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), TableError> {
     Ok(())
 }
 
-fn scan_result_to_batch(result: &ScanResult) -> RowBatch {
-    let columns = result
-        .columns()
-        .iter()
-        .map(|(name, column)| {
-            let data = match column {
-                crate::scan::ScanColumn::F64(values) => ColumnData::F64(values.to_vec()),
-                crate::scan::ScanColumn::I64(values) => ColumnData::I64(values.to_vec()),
-                crate::scan::ScanColumn::Timestamp(values) => {
-                    ColumnData::Timestamp(values.to_vec())
-                }
-                crate::scan::ScanColumn::FixedStr { width, values } => ColumnData::FixedStr {
-                    width: *width,
-                    values: values.to_vec(),
-                },
-            };
-            (name.clone(), data)
-        })
-        .collect::<Vec<_>>();
-    RowBatch::from_parts(columns, result.row_count())
-}
-
 /// Table error.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TableError {
@@ -660,9 +652,10 @@ mod tests {
         let result = table.scan_time_range(15, 35).unwrap();
         assert_eq!(result.row_count(), 2);
         assert_eq!(
-            result.column("price").unwrap().as_f64().unwrap(),
-            &[2.0, 3.0]
+            result.column("price").unwrap().f64_values().unwrap(),
+            vec![2.0, 3.0]
         );
+        assert!(result.column("price").unwrap().has_mapped_chunks());
         assert_eq!(table.recover_records().unwrap().len(), 1);
         assert_eq!(table.recover_batches().unwrap(), vec![batch(&schema)]);
 
@@ -679,7 +672,10 @@ mod tests {
         let predicate = RangePredicate::new("price", 2.5, 5.0);
         let result = table.scan_where((0, 35), &predicate).unwrap();
         assert_eq!(result.row_count(), 1);
-        assert_eq!(result.column("volume").unwrap().as_i64().unwrap(), &[300]);
+        assert_eq!(
+            result.column("volume").unwrap().i64_values().unwrap(),
+            vec![300]
+        );
 
         fs::remove_dir_all(path).unwrap();
     }
@@ -711,9 +707,10 @@ mod tests {
         let result = table.scan_time_range(15, 45).unwrap();
         assert_eq!(result.row_count(), 3);
         assert_eq!(
-            result.column("price").unwrap().as_f64().unwrap(),
-            &[2.0, 3.0, 4.0]
+            result.column("price").unwrap().f64_values().unwrap(),
+            vec![2.0, 3.0, 4.0]
         );
+        assert!(result.column("price").unwrap().has_mapped_chunks());
 
         table
             .append(
@@ -733,9 +730,10 @@ mod tests {
         let result = reopened.scan_time_range(35, 60).unwrap();
         assert_eq!(result.row_count(), 2);
         assert_eq!(
-            result.column("price").unwrap().as_f64().unwrap(),
-            &[4.0, 5.0]
+            result.column("price").unwrap().f64_values().unwrap(),
+            vec![4.0, 5.0]
         );
+        assert!(result.column("price").unwrap().has_mapped_chunks());
 
         fs::remove_dir_all(path).unwrap();
     }
@@ -766,8 +764,8 @@ mod tests {
         let result = table.scan_time_range(0, 30).unwrap();
         assert_eq!(result.row_count(), 2);
         assert_eq!(
-            result.column("price").unwrap().as_f64().unwrap(),
-            &[1.0, 2.0]
+            result.column("price").unwrap().f64_values().unwrap(),
+            vec![1.0, 2.0]
         );
 
         drop(table);
@@ -776,8 +774,8 @@ mod tests {
         let result = reopened.scan_time_range(0, 30).unwrap();
         assert_eq!(result.row_count(), 2);
         assert_eq!(
-            result.column("volume").unwrap().as_i64().unwrap(),
-            &[100, 200]
+            result.column("volume").unwrap().i64_values().unwrap(),
+            vec![100, 200]
         );
 
         fs::remove_dir_all(path).unwrap();
