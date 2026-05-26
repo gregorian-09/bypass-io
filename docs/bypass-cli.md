@@ -29,7 +29,8 @@ cargo run --release -p bypass-cli -- bench uring \
   --file /tmp/bypass-uring.bin \
   --buf-size 4096 \
   --depth 1 \
-  --duration 10s
+  --duration 10s \
+  --history /tmp/bypass-bench-history.jsonl
 ```
 
 Run a local `bypass-db` append benchmark:
@@ -39,7 +40,8 @@ cargo run --release -p bypass-cli -- bench db \
   --path /tmp/bypass-db \
   --rows-per-batch 10000 \
   --batches 1000 \
-  --scan-iterations 10
+  --scan-iterations 10 \
+  --history /tmp/bypass-bench-history.jsonl
 ```
 
 The database benchmark now reports append throughput, mmap-backed time-range
@@ -52,8 +54,14 @@ cargo run --release -p bypass-cli -- bench db \
   --rows-per-batch 10000 \
   --batches 1000 \
   --scan-iterations 10 \
-  --compact
+  --compact \
+  --history /tmp/bypass-bench-history.jsonl
 ```
+
+When `--history` is provided, the CLI appends one JSON object per benchmark
+measurement to the given JSON-lines file. It also compares the current rate to
+the latest previous record with the same benchmark name and prints a
+`benchmark_history` line.
 
 `bench spdk` and `bench dpdk` currently return explicit unsupported errors.
 They are reserved for native runtime benchmark paths once the workspace can run

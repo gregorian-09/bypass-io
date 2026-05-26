@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use crate::batch::{BatchError, ColumnData, RowBatch};
 use crate::scan::{
-    filter_scan_indices, range_filter_i64_mapped, ColumnPredicate, ScanError, ScanResult,
+    filter_scan_indices, range_filter_i64_mapped, ColumnPredicate, RowSelection, ScanError,
+    ScanResult,
 };
 use crate::schema::Schema;
 use crate::segment::{seal_batch, segment_ref, ImmutableSegment, Manifest};
@@ -119,10 +120,10 @@ impl Table {
             let timestamp_map =
                 Arc::new(segment.map_column(timestamp_column.name(), timestamp_column.dtype())?);
             let indices = range_filter_i64_mapped(&timestamp_map, start, end)?;
-            if indices.is_empty() {
+            let selection = RowSelection::from_indices(indices, timestamp_map.row_count());
+            if selection.is_empty() {
                 continue;
             }
-            let indices = Arc::<[usize]>::from(indices);
             let mut columns = Vec::with_capacity(self.schema.columns().len());
             for column in self.schema.columns() {
                 let mapped = if column.name() == timestamp_column.name() {
@@ -132,7 +133,7 @@ impl Table {
                 };
                 columns.push((column.name().to_string(), mapped));
             }
-            output.append_mapped_columns(columns, indices)?;
+            output.append_mapped_columns(columns, selection)?;
         }
         output.append_batch(&filter_time_batch(&self.schema, &self.active, start, end)?)?;
         Ok(output)

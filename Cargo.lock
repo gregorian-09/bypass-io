@@ -65,6 +65,8 @@ dependencies = [
  "bypass-db",
  "bypass-io",
  "clap",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

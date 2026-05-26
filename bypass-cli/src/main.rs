@@ -1,14 +1,15 @@
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bypass_db::{ColumnData, ColumnDef, DType, RangePredicate, RowBatch, Schema, Table};
 use bypass_io::{BypassConfig, UringBackend};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 fn main() {
@@ -67,14 +68,23 @@ fn run_bench(command: BenchCommand) -> Result<(), CliError> {
             buf_size,
             depth,
             duration,
-        } => bench_uring(file, buf_size, depth, duration),
+            history,
+        } => bench_uring(file, buf_size, depth, duration, history.as_deref()),
         BenchCommand::Db {
             path,
             rows_per_batch,
             batches,
             scan_iterations,
             compact,
-        } => bench_db(path, rows_per_batch, batches, scan_iterations, compact),
+            history,
+        } => bench_db(
+            path,
+            rows_per_batch,
+            batches,
+            scan_iterations,
+            compact,
+            history.as_deref(),
+        ),
         BenchCommand::Spdk { pci, .. } => {
             warn!(
                 event = "spdk_benchmark_unsupported",
@@ -103,6 +113,7 @@ fn bench_uring(
     buf_size: usize,
     _depth: usize,
     duration: Duration,
+    history: Option<&Path>,
 ) -> Result<(), CliError> {
     let backend = UringBackend::new(256).map_err(CliError::Io)?;
     let file_handle = OpenOptions::new()
@@ -143,6 +154,12 @@ fn bench_uring(
         "completed io_uring write benchmark"
     );
     print_benchmark_result("uring_write", ops, bytes, elapsed);
+    record_benchmark(
+        history,
+        BenchRecord::new("uring_write", "ops", ops, elapsed)
+            .with_bytes(bytes)
+            .with_context("buf_size", buf_size),
+    )?;
     Ok(())
 }
 
@@ -152,6 +169,7 @@ fn bench_db(
     batches: usize,
     scan_iterations: usize,
     compact: bool,
+    history: Option<&Path>,
 ) -> Result<(), CliError> {
     let schema = Schema::new(
         "trades",
@@ -190,6 +208,12 @@ fn bench_db(
         elapsed.as_millis(),
         rate(total_rows, elapsed)
     );
+    record_benchmark(
+        history,
+        BenchRecord::new("db_append", "rows", total_rows, elapsed)
+            .with_context("rows_per_batch", rows_per_batch)
+            .with_context("batches", batches),
+    )?;
 
     let scan_start = Instant::now();
     let mut scanned_rows = 0usize;
@@ -215,6 +239,12 @@ fn bench_db(
         scan_elapsed.as_millis(),
         rate(scanned_rows, scan_elapsed)
     );
+    record_benchmark(
+        history,
+        BenchRecord::new("db_scan_time_range", "rows", scanned_rows, scan_elapsed)
+            .with_context("iterations", scan_iterations)
+            .with_context("table_rows", total_rows),
+    )?;
 
     let predicate = RangePredicate::new("price", 100.0, 110.0);
     let predicate_start = Instant::now();
@@ -241,6 +271,17 @@ fn bench_db(
         predicate_elapsed.as_millis(),
         rate(predicate_rows, predicate_elapsed)
     );
+    record_benchmark(
+        history,
+        BenchRecord::new(
+            "db_scan_predicate",
+            "rows",
+            predicate_rows,
+            predicate_elapsed,
+        )
+        .with_context("iterations", scan_iterations)
+        .with_context("table_rows", total_rows),
+    )?;
 
     if compact {
         let segment_ids = table
@@ -265,6 +306,10 @@ fn bench_db(
             segment_ids.len(),
             compact_elapsed.as_millis()
         );
+        record_benchmark(
+            history,
+            BenchRecord::new("db_compact", "segments", segment_ids.len(), compact_elapsed),
+        )?;
     }
     Ok(())
 }
@@ -320,6 +365,118 @@ fn rate(units: usize, elapsed: Duration) -> f64 {
 
 fn mib_per_sec(bytes: usize, elapsed: Duration) -> f64 {
     bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct BenchRecord {
+    benchmark: String,
+    unit: String,
+    units: usize,
+    bytes: Option<usize>,
+    elapsed_ms: u64,
+    rate_per_sec: f64,
+    mib_per_sec: Option<f64>,
+    context: Vec<BenchContext>,
+    timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct BenchContext {
+    key: String,
+    value: usize,
+}
+
+impl BenchRecord {
+    fn new(
+        benchmark: impl Into<String>,
+        unit: impl Into<String>,
+        units: usize,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            benchmark: benchmark.into(),
+            unit: unit.into(),
+            units,
+            bytes: None,
+            elapsed_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+            rate_per_sec: rate(units, elapsed),
+            mib_per_sec: None,
+            context: Vec::new(),
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        }
+    }
+
+    fn with_bytes(mut self, bytes: usize) -> Self {
+        self.bytes = Some(bytes);
+        self.mib_per_sec = Some(mib_per_sec(
+            bytes,
+            Duration::from_millis(self.elapsed_ms.max(1)),
+        ));
+        self
+    }
+
+    fn with_context(mut self, key: impl Into<String>, value: usize) -> Self {
+        self.context.push(BenchContext {
+            key: key.into(),
+            value,
+        });
+        self
+    }
+}
+
+fn record_benchmark(history: Option<&Path>, record: BenchRecord) -> Result<(), CliError> {
+    let Some(path) = history else {
+        return Ok(());
+    };
+    let previous = latest_history_record(path, &record.benchmark)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(CliError::Io)?;
+    serde_json::to_writer(&mut file, &record).map_err(CliError::Json)?;
+    file.write_all(b"\n").map_err(CliError::Io)?;
+    if let Some(previous) = previous {
+        let delta = percent_delta(previous.rate_per_sec, record.rate_per_sec);
+        println!(
+            "benchmark_history benchmark={} previous_rate={:.2} current_rate={:.2} delta_percent={:.2}",
+            record.benchmark, previous.rate_per_sec, record.rate_per_sec, delta
+        );
+    } else {
+        println!(
+            "benchmark_history benchmark={} previous_rate=none",
+            record.benchmark
+        );
+    }
+    Ok(())
+}
+
+fn latest_history_record(path: &Path, benchmark: &str) -> Result<Option<BenchRecord>, CliError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path).map_err(CliError::Io)?;
+    let mut latest = None;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record = serde_json::from_str::<BenchRecord>(line).map_err(CliError::Json)?;
+        if record.benchmark == benchmark {
+            latest = Some(record);
+        }
+    }
+    Ok(latest)
+}
+
+fn percent_delta(previous: f64, current: f64) -> f64 {
+    if previous.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        ((current - previous) / previous) * 100.0
+    }
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -407,6 +564,9 @@ enum BenchCommand {
         /// Benchmark duration, such as `500ms`, `10s`, `2m`, or `1h`.
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         duration: Duration,
+        /// JSON-lines history file for recording and comparing benchmark runs.
+        #[arg(long)]
+        history: Option<PathBuf>,
     },
     /// Benchmark local `bypass-db` append throughput.
     Db {
@@ -425,6 +585,9 @@ enum BenchCommand {
         /// Benchmark segment compaction after scan benchmarks.
         #[arg(long)]
         compact: bool,
+        /// JSON-lines history file for recording and comparing benchmark runs.
+        #[arg(long)]
+        history: Option<PathBuf>,
     },
     /// Placeholder for native SPDK benchmark support.
     Spdk {
@@ -466,13 +629,19 @@ enum CliError {
     Schema(bypass_db::schema::SchemaError),
     Batch(bypass_db::batch::BatchError),
     Table(bypass_db::table::TableError),
+    Json(serde_json::Error),
 }
 
 impl CliError {
     fn exit_code(&self) -> i32 {
         match self {
             Self::Unsupported(_) => 3,
-            Self::Io(_) | Self::Config(_) | Self::Schema(_) | Self::Batch(_) | Self::Table(_) => 1,
+            Self::Io(_)
+            | Self::Config(_)
+            | Self::Schema(_)
+            | Self::Batch(_)
+            | Self::Table(_)
+            | Self::Json(_) => 1,
         }
     }
 }
@@ -486,6 +655,7 @@ impl fmt::Display for CliError {
             Self::Schema(err) => write!(f, "{err}"),
             Self::Batch(err) => write!(f, "{err}"),
             Self::Table(err) => write!(f, "{err}"),
+            Self::Json(err) => write!(f, "{err}"),
         }
     }
 }

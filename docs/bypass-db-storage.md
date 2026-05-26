@@ -90,6 +90,10 @@ returned `ScanResult`. A result column is chunked:
 - sealed chunks reference a `MappedColumn` plus selected row indices
 - active mutable rows remain owned chunks
 
+Mapped row selections are compressed when possible. A full-segment selection is
+stored as `All`, a contiguous filtered span is stored as `Range`, and only
+non-contiguous selections store an explicit index array.
+
 This avoids reading every selected sealed column into an owned `RowBatch` before
 returning scan data. Callers that need contiguous vectors can use
 `ScanColumn::f64_values`, `ScanColumn::i64_values`,
@@ -106,13 +110,13 @@ Time-range filtering on sealed timestamp columns runs over validated mmap bytes.
 On little-endian `x86_64` with AVX2, the scan uses a 4-lane `i64` SIMD kernel.
 Other targets fall back to the same checked scalar comparison.
 
-`RangePredicate` filtering on `F64` columns uses a 4-lane AVX kernel on
-little-endian `x86_64` with AVX support. Other targets fall back to scalar
-filtering. The SIMD paths are runtime feature-detected before use.
+`RangePredicate` and `GtPredicate` filtering on `F64` columns use 4-lane AVX
+kernels on little-endian `x86_64` with AVX support. Other targets fall back to
+scalar filtering. The SIMD paths are runtime feature-detected before use.
 
 ## Current Boundary
 
-The high-level scan path now keeps sealed segment results mmap-backed, but it
-still stores selected row indices separately from the mapped bytes. Future work
-can add range-compressed selections, typed-slice proofs for aligned full-column
-reads, and broader SIMD kernels for additional predicate shapes.
+The high-level scan path now keeps sealed segment results mmap-backed and
+compresses full or contiguous mapped selections. It still avoids exposing typed
+slices over mmap bytes. Future work can add typed-slice proofs for aligned
+full-column reads and broader SIMD kernels for additional predicate shapes.

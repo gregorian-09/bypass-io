@@ -59,3 +59,16 @@ cargo test --features dpdk
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+## Native Runtime Status
+
+`DpdkBackend::native_status()` reports whether the current Rust build links a
+native DPDK adapter. The current repository reports `linked = false`. That is
+intentional until a machine with DPDK headers/libraries, configured hugepages,
+NIC binding, and a safe mbuf ownership design is available for hardware
+validation.
+
+The Rust-side backend validates EAL/port configuration, queue bounds, target
+routing, packet parsing, multicast flow-rule inputs, polling delegation, and
+error surfaces. It does not claim real NIC RX/TX until native DPDK symbols are
+linked and tested against bound NIC devices.

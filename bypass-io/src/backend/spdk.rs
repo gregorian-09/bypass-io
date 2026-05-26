@@ -35,6 +35,15 @@ impl fmt::Debug for SpdkBackend {
 }
 
 impl SpdkBackend {
+    /// Return the native SPDK runtime integration status for this build.
+    #[must_use]
+    pub const fn native_status() -> SpdkNativeStatus {
+        SpdkNativeStatus {
+            linked: false,
+            detail: "native SPDK symbols are not linked; Rust validation runtime is active",
+        }
+    }
+
     /// Probe PCIe NVMe devices and initialize SPDK.
     ///
     /// # Errors
@@ -140,6 +149,15 @@ impl SpdkBackend {
             runtime,
         }
     }
+}
+
+/// Native SPDK runtime status for the current build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpdkNativeStatus {
+    /// Whether this build links a native SPDK runtime adapter.
+    pub linked: bool,
+    /// Human-readable status detail.
+    pub detail: &'static str,
 }
 
 impl IoBackend for SpdkBackend {
@@ -834,6 +852,13 @@ mod tests {
 
     #[test]
     fn probe_reports_unavailable_without_native_spdk_runtime() {
+        assert_eq!(
+            SpdkBackend::native_status(),
+            super::SpdkNativeStatus {
+                linked: false,
+                detail: "native SPDK symbols are not linked; Rust validation runtime is active"
+            }
+        );
         assert_eq!(
             SpdkBackend::probe_and_init().unwrap_err(),
             SpdkError::RuntimeUnavailable {

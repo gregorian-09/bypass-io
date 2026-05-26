@@ -57,13 +57,13 @@ impl ScanResult {
     pub(crate) fn append_mapped_columns(
         &mut self,
         columns: Vec<(String, Arc<MappedColumn>)>,
-        indices: Arc<[usize]>,
+        selection: RowSelection,
     ) -> Result<(), ScanError> {
-        let row_count = indices.len();
+        let row_count = selection.len();
         self.append_columns(
-            columns.into_iter().map(|(name, column)| {
-                (name, ScanColumn::from_mapped(column, Arc::clone(&indices)))
-            }),
+            columns
+                .into_iter()
+                .map(|(name, column)| (name, ScanColumn::from_mapped(column, selection.clone()))),
             row_count,
         )
     }
@@ -179,7 +179,92 @@ pub enum FixedStrChunk {
 #[derive(Clone, Debug)]
 pub struct MappedSelection {
     column: Arc<MappedColumn>,
-    indices: Arc<[usize]>,
+    rows: RowSelection,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum RowSelection {
+    All { len: usize },
+    Range { start: usize, len: usize },
+    Indices(Arc<[usize]>),
+}
+
+impl RowSelection {
+    pub(crate) fn from_indices(indices: Vec<usize>, total_rows: usize) -> Self {
+        if indices.len() == total_rows && indices.iter().copied().eq(0..total_rows) {
+            return Self::All { len: total_rows };
+        }
+        let Some((&first, rest)) = indices.split_first() else {
+            return Self::Range { start: 0, len: 0 };
+        };
+        if rest
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(offset, value)| value == first + offset + 1)
+        {
+            return Self::Range {
+                start: first,
+                len: indices.len(),
+            };
+        }
+        Self::Indices(indices.into())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::All { len } | Self::Range { len, .. } => *len,
+            Self::Indices(indices) => indices.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn is_identity(&self) -> bool {
+        matches!(self, Self::All { .. })
+    }
+
+    fn index_at(&self, local_idx: usize) -> Option<usize> {
+        match self {
+            Self::All { len } => (local_idx < *len).then_some(local_idx),
+            Self::Range { start, len } => (local_idx < *len).then_some(start + local_idx),
+            Self::Indices(indices) => indices.get(local_idx).copied(),
+        }
+    }
+
+    fn iter(&self) -> RowSelectionIter<'_> {
+        RowSelectionIter {
+            selection: self,
+            next: 0,
+        }
+    }
+
+    fn take_local_indices(&self, local_indices: &[usize]) -> Self {
+        Self::from_indices(
+            local_indices
+                .iter()
+                .filter_map(|&local_idx| self.index_at(local_idx))
+                .collect(),
+            self.len(),
+        )
+    }
+}
+
+struct RowSelectionIter<'a> {
+    selection: &'a RowSelection,
+    next: usize,
+}
+
+impl Iterator for RowSelectionIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self.selection.index_at(self.next)?;
+        self.next += 1;
+        Some(value)
+    }
 }
 
 impl ScanColumn {
@@ -195,8 +280,8 @@ impl ScanColumn {
         }
     }
 
-    fn from_mapped(column: Arc<MappedColumn>, indices: Arc<[usize]>) -> Self {
-        let selection = MappedSelection { column, indices };
+    fn from_mapped(column: Arc<MappedColumn>, rows: RowSelection) -> Self {
+        let selection = MappedSelection { column, rows };
         match selection.column.dtype() {
             DType::F64 => Self::F64(Arc::from([F64Chunk::Mapped(selection)])),
             DType::I64 => Self::I64(Arc::from([I64Chunk::Mapped(selection)])),
@@ -367,6 +452,23 @@ impl ScanColumn {
         }
         Some(output)
     }
+
+    fn gt_filter_f64(&self, threshold: f64) -> Option<Vec<usize>> {
+        let Self::F64(chunks) = self else {
+            return None;
+        };
+        let mut output = Vec::new();
+        let mut base = 0usize;
+        for chunk in chunks.iter() {
+            let local = match chunk {
+                F64Chunk::Owned(values) => simd::gt_filter_f64_values(values, threshold),
+                F64Chunk::Mapped(selection) => simd::gt_filter_f64_selection(selection, threshold),
+            };
+            output.extend(local.into_iter().map(|idx| base + idx));
+            base += chunk.row_count();
+        }
+        Some(output)
+    }
 }
 
 impl PartialEq for ScanColumn {
@@ -393,7 +495,7 @@ impl F64Chunk {
     fn row_count(&self) -> usize {
         match self {
             Self::Owned(values) => values.len(),
-            Self::Mapped(selection) => selection.indices.len(),
+            Self::Mapped(selection) => selection.rows.len(),
         }
     }
 }
@@ -402,7 +504,7 @@ impl I64Chunk {
     fn row_count(&self) -> usize {
         match self {
             Self::Owned(values) => values.len(),
-            Self::Mapped(selection) => selection.indices.len(),
+            Self::Mapped(selection) => selection.rows.len(),
         }
     }
 }
@@ -411,7 +513,7 @@ impl FixedStrChunk {
     fn row_count(&self) -> usize {
         match self {
             Self::Owned(values) => values.len(),
-            Self::Mapped(selection) => selection.indices.len(),
+            Self::Mapped(selection) => selection.rows.len(),
         }
     }
 }
@@ -439,6 +541,11 @@ pub trait ColumnPredicate: Send + Sync {
 
     /// Return an `f64` range when this predicate is exactly `min <= x < max`.
     fn f64_range(&self) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// Return an `f64` threshold when this predicate is exactly `x > threshold`.
+    fn f64_gt(&self) -> Option<f64> {
         None
     }
 
@@ -522,6 +629,10 @@ impl ColumnPredicate for GtPredicate {
 
     fn test_f64(&self, value: f64) -> bool {
         value > self.threshold
+    }
+
+    fn f64_gt(&self) -> Option<f64> {
+        Some(self.threshold)
     }
 
     fn test_i64(&self, value: i64) -> bool {
@@ -615,6 +726,11 @@ pub(crate) fn filter_scan_indices(
             return Ok(indices);
         }
     }
+    if let Some(threshold) = predicate.f64_gt() {
+        if let Some(indices) = column.gt_filter_f64(threshold) {
+            return Ok(indices);
+        }
+    }
     Ok((0..result.row_count())
         .filter(|&idx| column.test_at(idx, predicate))
         .collect())
@@ -682,9 +798,9 @@ fn flatten_f64_chunks(chunks: &[F64Chunk]) -> Vec<f64> {
             F64Chunk::Owned(values) => output.extend(values.iter().copied()),
             F64Chunk::Mapped(selection) => output.extend(
                 selection
-                    .indices
+                    .rows
                     .iter()
-                    .filter_map(|&idx| selection.column.f64_value(idx)),
+                    .filter_map(|idx| selection.column.f64_value(idx)),
             ),
         }
     }
@@ -698,9 +814,9 @@ fn flatten_i64_chunks(chunks: &[I64Chunk]) -> Vec<i64> {
             I64Chunk::Owned(values) => output.extend(values.iter().copied()),
             I64Chunk::Mapped(selection) => output.extend(
                 selection
-                    .indices
+                    .rows
                     .iter()
-                    .filter_map(|&idx| selection.column.i64_value(idx)),
+                    .filter_map(|idx| selection.column.i64_value(idx)),
             ),
         }
     }
@@ -714,9 +830,9 @@ fn flatten_fixed_str_chunks(chunks: &[FixedStrChunk]) -> Vec<Vec<u8>> {
             FixedStrChunk::Owned(values) => output.extend(values.iter().cloned()),
             FixedStrChunk::Mapped(selection) => output.extend(
                 selection
-                    .indices
+                    .rows
                     .iter()
-                    .filter_map(|&idx| selection.column.fixed_str_value(idx).map(<[u8]>::to_vec)),
+                    .filter_map(|idx| selection.column.fixed_str_value(idx).map(<[u8]>::to_vec)),
             ),
         }
     }
@@ -739,11 +855,7 @@ fn take_f64_chunks(chunks: &[F64Chunk], indices: &[usize]) -> Arc<[F64Chunk]> {
             )),
             F64Chunk::Mapped(selection) => output.push(F64Chunk::Mapped(MappedSelection {
                 column: Arc::clone(&selection.column),
-                indices: local_indices
-                    .iter()
-                    .map(|&idx| selection.indices[idx])
-                    .collect::<Vec<_>>()
-                    .into(),
+                rows: selection.rows.take_local_indices(&local_indices),
             })),
         }
     }
@@ -766,11 +878,7 @@ fn take_i64_chunks(chunks: &[I64Chunk], indices: &[usize]) -> Arc<[I64Chunk]> {
             )),
             I64Chunk::Mapped(selection) => output.push(I64Chunk::Mapped(MappedSelection {
                 column: Arc::clone(&selection.column),
-                indices: local_indices
-                    .iter()
-                    .map(|&idx| selection.indices[idx])
-                    .collect::<Vec<_>>()
-                    .into(),
+                rows: selection.rows.take_local_indices(&local_indices),
             })),
         }
     }
@@ -797,11 +905,7 @@ fn take_fixed_str_chunks(chunks: &[FixedStrChunk], indices: &[usize]) -> Arc<[Fi
             FixedStrChunk::Mapped(selection) => {
                 output.push(FixedStrChunk::Mapped(MappedSelection {
                     column: Arc::clone(&selection.column),
-                    indices: local_indices
-                        .iter()
-                        .map(|&idx| selection.indices[idx])
-                        .collect::<Vec<_>>()
-                        .into(),
+                    rows: selection.rows.take_local_indices(&local_indices),
                 }))
             }
         }
@@ -837,9 +941,9 @@ fn value_at_f64(chunks: &[F64Chunk], mut index: usize) -> Option<f64> {
             return match chunk {
                 F64Chunk::Owned(values) => values.get(index).copied(),
                 F64Chunk::Mapped(selection) => selection
-                    .indices
-                    .get(index)
-                    .and_then(|&mapped_idx| selection.column.f64_value(mapped_idx)),
+                    .rows
+                    .index_at(index)
+                    .and_then(|mapped_idx| selection.column.f64_value(mapped_idx)),
             };
         }
         index -= row_count;
@@ -854,9 +958,9 @@ fn value_at_i64(chunks: &[I64Chunk], mut index: usize) -> Option<i64> {
             return match chunk {
                 I64Chunk::Owned(values) => values.get(index).copied(),
                 I64Chunk::Mapped(selection) => selection
-                    .indices
-                    .get(index)
-                    .and_then(|&mapped_idx| selection.column.i64_value(mapped_idx)),
+                    .rows
+                    .index_at(index)
+                    .and_then(|mapped_idx| selection.column.i64_value(mapped_idx)),
             };
         }
         index -= row_count;
@@ -871,9 +975,9 @@ fn value_at_fixed_str(chunks: &[FixedStrChunk], mut index: usize) -> Option<Vec<
             return match chunk {
                 FixedStrChunk::Owned(values) => values.get(index).cloned(),
                 FixedStrChunk::Mapped(selection) => selection
-                    .indices
-                    .get(index)
-                    .and_then(|&mapped_idx| selection.column.fixed_str_value(mapped_idx))
+                    .rows
+                    .index_at(index)
+                    .and_then(|mapped_idx| selection.column.fixed_str_value(mapped_idx))
                     .map(<[u8]>::to_vec),
             };
         }
@@ -929,30 +1033,61 @@ mod simd {
         scalar_range_filter_f64(values.iter().copied(), min, max)
     }
 
+    pub(super) fn gt_filter_f64_values(values: &[f64], threshold: f64) -> Vec<usize> {
+        #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx") {
+                // Safety: AVX support is checked at runtime and `values`
+                // points to initialized f64 elements.
+                return unsafe { gt_filter_f64_values_avx(values, threshold) };
+            }
+        }
+
+        scalar_gt_filter_f64(values.iter().copied(), threshold)
+    }
+
     pub(super) fn range_filter_f64_selection(
         selection: &MappedSelection,
         min: f64,
         max: f64,
     ) -> Vec<usize> {
-        if selection
-            .indices
-            .iter()
-            .enumerate()
-            .all(|(local_idx, &mapped_idx)| local_idx == mapped_idx)
-        {
+        if selection.rows.is_identity() {
             if let Ok(indices) = range_filter_f64_bytes(selection.column.as_bytes(), min, max) {
                 return indices;
             }
         }
         selection
-            .indices
+            .rows
             .iter()
             .enumerate()
-            .filter_map(|(local_idx, &mapped_idx)| {
+            .filter_map(|(local_idx, mapped_idx)| {
                 selection
                     .column
                     .f64_value(mapped_idx)
                     .filter(|value| *value >= min && *value < max)
+                    .map(|_| local_idx)
+            })
+            .collect()
+    }
+
+    pub(super) fn gt_filter_f64_selection(
+        selection: &MappedSelection,
+        threshold: f64,
+    ) -> Vec<usize> {
+        if selection.rows.is_identity() {
+            if let Ok(indices) = gt_filter_f64_bytes(selection.column.as_bytes(), threshold) {
+                return indices;
+            }
+        }
+        selection
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(local_idx, mapped_idx)| {
+                selection
+                    .column
+                    .f64_value(mapped_idx)
+                    .filter(|value| *value > threshold)
                     .map(|_| local_idx)
             })
             .collect()
@@ -985,6 +1120,33 @@ mod simd {
             .collect())
     }
 
+    fn gt_filter_f64_bytes(bytes: &[u8], threshold: f64) -> Result<Vec<usize>, ScanError> {
+        if !bytes.len().is_multiple_of(8) {
+            return Err(ScanError::InvalidColumnBytes {
+                len: bytes.len(),
+                width: 8,
+            });
+        }
+
+        #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx") {
+                // Safety: AVX support is checked at runtime and the byte
+                // slice length is validated as a multiple of 8.
+                return Ok(unsafe { gt_filter_f64_bytes_avx(bytes, threshold) });
+            }
+        }
+
+        Ok(bytes
+            .chunks_exact(8)
+            .enumerate()
+            .filter_map(|(idx, chunk)| {
+                let value = f64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"));
+                (value > threshold).then_some(idx)
+            })
+            .collect())
+    }
+
     fn scalar_range_filter_f64(
         values: impl Iterator<Item = f64>,
         min: f64,
@@ -993,6 +1155,13 @@ mod simd {
         values
             .enumerate()
             .filter_map(|(idx, value)| (value >= min && value < max).then_some(idx))
+            .collect()
+    }
+
+    fn scalar_gt_filter_f64(values: impl Iterator<Item = f64>, threshold: f64) -> Vec<usize> {
+        values
+            .enumerate()
+            .filter_map(|(idx, value)| (value > threshold).then_some(idx))
             .collect()
     }
 
@@ -1076,6 +1245,34 @@ mod simd {
 
     #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
     #[target_feature(enable = "avx")]
+    unsafe fn gt_filter_f64_values_avx(values: &[f64], threshold: f64) -> Vec<usize> {
+        use std::arch::x86_64::{
+            _mm256_cmp_pd, _mm256_loadu_pd, _mm256_movemask_pd, _mm256_set1_pd, _CMP_GT_OQ,
+        };
+
+        let mut output = Vec::new();
+        let mut idx = 0usize;
+        let threshold_v = _mm256_set1_pd(threshold);
+        while idx + 4 <= values.len() {
+            // Safety: `idx + 4 <= values.len()`, so four initialized f64
+            // values are readable. `_mm256_loadu_pd` permits unaligned input.
+            let ptr = unsafe { values.as_ptr().add(idx) };
+            let loaded = unsafe { _mm256_loadu_pd(ptr) };
+            let mask = _mm256_movemask_pd(_mm256_cmp_pd(loaded, threshold_v, _CMP_GT_OQ)) as u32;
+            push_mask_indices(mask, idx, &mut output);
+            idx += 4;
+        }
+
+        for (offset, &value) in values[idx..].iter().enumerate() {
+            if value > threshold {
+                output.push(idx + offset);
+            }
+        }
+        output
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    #[target_feature(enable = "avx")]
     unsafe fn range_filter_f64_bytes_avx(bytes: &[u8], min: f64, max: f64) -> Vec<usize> {
         use std::arch::x86_64::{
             _mm256_and_pd, _mm256_cmp_pd, _mm256_loadu_pd, _mm256_movemask_pd, _mm256_set1_pd,
@@ -1116,6 +1313,43 @@ mod simd {
     }
 
     #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    #[target_feature(enable = "avx")]
+    unsafe fn gt_filter_f64_bytes_avx(bytes: &[u8], threshold: f64) -> Vec<usize> {
+        use std::arch::x86_64::{
+            _mm256_cmp_pd, _mm256_loadu_pd, _mm256_movemask_pd, _mm256_set1_pd, _CMP_GT_OQ,
+        };
+
+        let lanes = bytes.len() / 8;
+        let mut output = Vec::new();
+        let mut idx = 0usize;
+        let threshold_v = _mm256_set1_pd(threshold);
+        while idx + 4 <= lanes {
+            // Safety: `idx + 4 <= lanes`, `lanes == bytes.len() / 8`, and
+            // the caller validated that `bytes.len()` is a multiple of 8.
+            let ptr = unsafe { bytes.as_ptr().add(idx * 8) }.cast::<f64>();
+            // Safety: `ptr` points at 32 readable bytes and unaligned loads
+            // are explicitly supported by `_mm256_loadu_pd`.
+            let loaded = unsafe { _mm256_loadu_pd(ptr) };
+            let mask = _mm256_movemask_pd(_mm256_cmp_pd(loaded, threshold_v, _CMP_GT_OQ)) as u32;
+            push_mask_indices(mask, idx, &mut output);
+            idx += 4;
+        }
+
+        for lane in idx..lanes {
+            let start_byte = lane * 8;
+            let value = f64::from_le_bytes(
+                bytes[start_byte..start_byte + 8]
+                    .try_into()
+                    .expect("slice is 8 bytes"),
+            );
+            if value > threshold {
+                output.push(lane);
+            }
+        }
+        output
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
     fn push_mask_indices(mut mask: u32, base: usize, output: &mut Vec<usize>) {
         while mask != 0 {
             let lane = mask.trailing_zeros() as usize;
@@ -1131,7 +1365,7 @@ mod tests {
     use crate::schema::{ColumnDef, DType, Schema};
 
     use super::{
-        filter_indices, filter_scan_indices, range_filter_i64_mapped, ColumnPredicate,
+        filter_indices, filter_scan_indices, range_filter_i64_mapped, ColumnPredicate, GtPredicate,
         RangePredicate, ScanResult,
     };
 
@@ -1177,6 +1411,32 @@ mod tests {
             filter_scan_indices(&result, &predicate).unwrap(),
             vec![0, 1]
         );
+    }
+
+    #[test]
+    fn scan_result_filters_with_simd_greater_than_path() {
+        let result = ScanResult::from_batch(&batch());
+        let predicate = GtPredicate::new("price", 19.0);
+        assert_eq!(
+            filter_scan_indices(&result, &predicate).unwrap(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn row_selection_compresses_identity_and_ranges() {
+        assert!(matches!(
+            super::RowSelection::from_indices(vec![0, 1, 2], 3),
+            super::RowSelection::All { len: 3 }
+        ));
+        assert!(matches!(
+            super::RowSelection::from_indices(vec![4, 5, 6], 10),
+            super::RowSelection::Range { start: 4, len: 3 }
+        ));
+        assert!(matches!(
+            super::RowSelection::from_indices(vec![1, 3, 4], 10),
+            super::RowSelection::Indices(_)
+        ));
     }
 
     #[test]

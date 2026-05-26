@@ -226,6 +226,15 @@ impl fmt::Debug for DpdkBackend {
 }
 
 impl DpdkBackend {
+    /// Return the native DPDK runtime integration status for this build.
+    #[must_use]
+    pub const fn native_status() -> DpdkNativeStatus {
+        DpdkNativeStatus {
+            linked: false,
+            detail: "native DPDK symbols are not linked; Rust validation runtime is active",
+        }
+    }
+
     /// Initialize DPDK and start the configured Ethernet port.
     ///
     /// # Errors
@@ -339,6 +348,15 @@ impl DpdkBackend {
     fn with_runtime(config: DpdkConfig, runtime: Arc<dyn DpdkRuntime>) -> Self {
         Self { config, runtime }
     }
+}
+
+/// Native DPDK runtime status for the current build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DpdkNativeStatus {
+    /// Whether this build links a native DPDK runtime adapter.
+    pub linked: bool,
+    /// Human-readable status detail.
+    pub detail: &'static str,
 }
 
 impl IoBackend for DpdkBackend {
@@ -1100,6 +1118,13 @@ mod tests {
 
     #[test]
     fn unavailable_backend_reports_runtime_unavailable() {
+        assert_eq!(
+            DpdkBackend::native_status(),
+            super::DpdkNativeStatus {
+                linked: false,
+                detail: "native DPDK symbols are not linked; Rust validation runtime is active"
+            }
+        );
         assert_eq!(
             DpdkBackend::init(config()).unwrap_err(),
             DpdkError::RuntimeUnavailable {

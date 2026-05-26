@@ -58,3 +58,16 @@ cargo test --features spdk
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+## Native Runtime Status
+
+`SpdkBackend::native_status()` reports whether the current Rust build links a
+native SPDK adapter. The current repository reports `linked = false`. That is
+intentional until a machine with SPDK headers/libraries, configured hugepages,
+VFIO/UIO permissions, and a safe completion-ownership design is available for
+hardware validation.
+
+The Rust-side backend validates namespace metadata, DMA-buffer eligibility,
+target routing, LBA conversion, queue-pair polling delegation, and error
+surfaces. It does not claim real NVMe hardware I/O until native SPDK symbols are
+linked and tested against bound NVMe devices.

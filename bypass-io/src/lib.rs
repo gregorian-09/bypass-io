@@ -11,12 +11,13 @@ pub mod ring;
 
 #[cfg(feature = "dpdk")]
 pub use backend::dpdk::{
-    DpdkBackend, DpdkConfig, DpdkError, DpdkPortConfig, EtherType, EthernetHeader, Ipv4Header,
-    MulticastGroup, Packet, QueueId, UdpHeader,
+    DpdkBackend, DpdkConfig, DpdkError, DpdkNativeStatus, DpdkPortConfig, EtherType,
+    EthernetHeader, Ipv4Header, MulticastGroup, Packet, QueueId, UdpHeader,
 };
 #[cfg(feature = "spdk")]
 pub use backend::spdk::{
     IoQueuePair, NvmeController, NvmeLbaRange, NvmeNamespace, SpdkBackend, SpdkError,
+    SpdkNativeStatus,
 };
 #[cfg(feature = "uring")]
 pub use backend::uring::UringBackend;
