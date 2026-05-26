@@ -161,6 +161,22 @@ impl WalWriter {
             .sync_all()
             .map_err(|err| WalError::Io(err.to_string()))
     }
+
+    /// Truncate the WAL and reset sequence numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when truncation or seeking fails.
+    pub fn reset(&mut self) -> Result<(), WalError> {
+        self.file
+            .set_len(0)
+            .map_err(|err| WalError::Io(err.to_string()))?;
+        self.file
+            .sync_all()
+            .map_err(|err| WalError::Io(err.to_string()))?;
+        self.next_seq_no = 0;
+        Ok(())
+    }
 }
 
 /// WAL reader.

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::batch::{BatchError, ColumnData, RowBatch};
 use crate::scan::{filter_indices, ColumnPredicate, ScanError, ScanResult};
 use crate::schema::Schema;
+use crate::segment::{seal_batch, segment_ref, ImmutableSegment, Manifest};
 use crate::wal::{WalError, WalReader, WalWriter};
 
 /// A bypass-db table.
@@ -14,6 +15,8 @@ pub struct Table {
     path: PathBuf,
     schema: Schema,
     active: RowBatch,
+    sealed: Vec<ImmutableSegment>,
+    manifest: Manifest,
     wal: WalWriter,
 }
 
@@ -28,10 +31,23 @@ impl Table {
         fs::create_dir_all(path.join("WAL")).map_err(|err| TableError::Io(err.to_string()))?;
         fs::create_dir_all(path.join("segments")).map_err(|err| TableError::Io(err.to_string()))?;
         let wal_path = path.join("WAL").join("wal-000000.log");
+        let manifest = Manifest::load(&path)?;
+        let sealed = manifest
+            .sealed_segments
+            .iter()
+            .map(|segment| ImmutableSegment::load(&path, segment))
+            .collect::<Result<Vec<_>, _>>()?;
+        manifest.store(&path)?;
         let wal = WalWriter::open(&wal_path)?;
+        let mut active = RowBatch::empty(&schema);
+        for batch in recover_batches_after(&schema, &wal_path, manifest.wal_records_applied)? {
+            active.append(&batch)?;
+        }
         Ok(Self {
             path,
-            active: RowBatch::empty(&schema),
+            active,
+            sealed,
+            manifest,
             schema,
             wal,
         })
@@ -53,6 +69,18 @@ impl Table {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.active.row_count()
+    }
+
+    /// Number of sealed segments.
+    #[must_use]
+    pub fn sealed_segment_count(&self) -> usize {
+        self.sealed.len()
+    }
+
+    /// Table manifest.
+    #[must_use]
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
     }
 
     /// Append a row batch.
@@ -78,20 +106,20 @@ impl Table {
     /// Returns an error when the schema timestamp column is missing from active
     /// data.
     pub fn scan_time_range(&self, start: i64, end: i64) -> Result<ScanResult, TableError> {
-        let timestamp_column = self.schema.timestamp_column().name();
-        let timestamps = self
-            .active
-            .column(timestamp_column)
-            .and_then(ColumnData::timestamp_values)
-            .ok_or_else(|| TableError::MissingColumn {
-                column: timestamp_column.to_string(),
-            })?;
-        let indices = timestamps
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &ts)| (ts >= start && ts < end).then_some(idx))
-            .collect::<Vec<_>>();
-        Ok(ScanResult::from_batch(&self.active.take_indices(&indices)))
+        let mut output = RowBatch::empty(&self.schema);
+        for segment in &self.sealed {
+            if !segment.overlaps_time_range(start, end) {
+                continue;
+            }
+            output.append(&filter_time_batch(
+                &self.schema,
+                &segment.read_batch(&self.schema)?,
+                start,
+                end,
+            )?)?;
+        }
+        output.append(&filter_time_batch(&self.schema, &self.active, start, end)?)?;
+        Ok(ScanResult::from_batch(&output))
     }
 
     /// Scan a time range with an additional column predicate.
@@ -110,13 +138,28 @@ impl Table {
         Ok(ScanResult::from_batch(&batch.take_indices(&indices)))
     }
 
-    /// Flush the WAL to durable storage.
+    /// Flush the WAL and seal active rows to an immutable segment.
     ///
     /// # Errors
     ///
-    /// Returns a WAL error when syncing fails.
-    pub fn flush(&self) -> Result<(), TableError> {
+    /// Returns a WAL, segment, or manifest error.
+    pub fn flush(&mut self) -> Result<(), TableError> {
         self.wal.sync()?;
+        if self.active.row_count() == 0 {
+            return Ok(());
+        }
+        let segment_id = self.manifest.next_segment_id;
+        let segment = seal_batch(&self.path, &self.schema, segment_id, &self.active)?;
+        self.manifest.next_segment_id = self
+            .manifest
+            .next_segment_id
+            .checked_add(1)
+            .ok_or_else(|| TableError::Manifest("segment id overflow".to_string()))?;
+        self.manifest.sealed_segments.push(segment_ref(&segment));
+        self.manifest.wal_records_applied = WalReader::open(self.wal.path())?.records()?.len();
+        self.manifest.store(&self.path)?;
+        self.sealed.push(segment);
+        self.active = RowBatch::empty(&self.schema);
         Ok(())
     }
 
@@ -145,6 +188,40 @@ impl Table {
             .map(|payload| decode_batch(&self.schema, payload))
             .collect()
     }
+}
+
+fn recover_batches_after(
+    schema: &Schema,
+    wal_path: &Path,
+    applied_records: usize,
+) -> Result<Vec<RowBatch>, TableError> {
+    WalReader::open(wal_path)?
+        .records()?
+        .into_iter()
+        .skip(applied_records)
+        .map(|record| decode_batch(schema, record.payload()))
+        .collect()
+}
+
+fn filter_time_batch(
+    schema: &Schema,
+    batch: &RowBatch,
+    start: i64,
+    end: i64,
+) -> Result<RowBatch, TableError> {
+    let timestamp_column = schema.timestamp_column().name();
+    let timestamps = batch
+        .column(timestamp_column)
+        .and_then(ColumnData::timestamp_values)
+        .ok_or_else(|| TableError::MissingColumn {
+            column: timestamp_column.to_string(),
+        })?;
+    let indices = timestamps
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &ts)| (ts >= start && ts < end).then_some(idx))
+        .collect::<Vec<_>>();
+    Ok(batch.take_indices(&indices))
 }
 
 fn validate_batch_matches_schema(schema: &Schema, rows: &RowBatch) -> Result<(), TableError> {
@@ -334,6 +411,10 @@ pub enum TableError {
     },
     /// WAL payload could not be decoded.
     PayloadDecode(&'static str),
+    /// Segment read or write failed.
+    Segment(String),
+    /// Manifest read or write failed.
+    Manifest(String),
 }
 
 impl fmt::Display for TableError {
@@ -346,6 +427,8 @@ impl fmt::Display for TableError {
             Self::MissingColumn { column } => write!(f, "missing column {column}"),
             Self::PayloadTooLarge { len } => write!(f, "payload too large: {len} bytes"),
             Self::PayloadDecode(err) => write!(f, "payload decode error: {err}"),
+            Self::Segment(err) => write!(f, "segment error: {err}"),
+            Self::Manifest(err) => write!(f, "manifest error: {err}"),
         }
     }
 }
@@ -508,6 +591,62 @@ mod tests {
         let result = table.scan_where((0, 35), &predicate).unwrap();
         assert_eq!(result.row_count(), 1);
         assert_eq!(result.column("volume").unwrap().as_i64().unwrap(), &[300]);
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn flush_seals_segment_and_reopen_scans_sealed_and_active_rows() {
+        let path = table_path("sealed");
+        let schema = schema();
+        let mut table = Table::open(&path, schema.clone()).unwrap();
+        table.append(&batch(&schema)).unwrap();
+        table.flush().unwrap();
+
+        assert_eq!(table.row_count(), 0);
+        assert_eq!(table.sealed_segment_count(), 1);
+        assert_eq!(table.manifest().sealed_segments.len(), 1);
+        assert_eq!(table.manifest().wal_records_applied, 1);
+        assert!(path.join("manifest.json").exists());
+        assert!(path
+            .join("segments")
+            .join("seg-000001")
+            .join("meta.json")
+            .exists());
+        assert!(path
+            .join("segments")
+            .join("seg-000001")
+            .join("price.col")
+            .exists());
+
+        let result = table.scan_time_range(15, 45).unwrap();
+        assert_eq!(result.row_count(), 3);
+        assert_eq!(
+            result.column("price").unwrap().as_f64().unwrap(),
+            &[2.0, 3.0, 4.0]
+        );
+
+        table
+            .append(
+                &RowBatch::builder(&schema)
+                    .column("timestamp", ColumnData::Timestamp(vec![50]))
+                    .column("price", ColumnData::F64(vec![5.0]))
+                    .column("volume", ColumnData::I64(vec![500]))
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        drop(table);
+
+        let reopened = Table::open(&path, schema).unwrap();
+        assert_eq!(reopened.sealed_segment_count(), 1);
+        assert_eq!(reopened.row_count(), 1);
+        let result = reopened.scan_time_range(35, 60).unwrap();
+        assert_eq!(result.row_count(), 2);
+        assert_eq!(
+            result.column("price").unwrap().as_f64().unwrap(),
+            &[4.0, 5.0]
+        );
 
         fs::remove_dir_all(path).unwrap();
     }

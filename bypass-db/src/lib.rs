@@ -4,6 +4,7 @@
 pub mod batch;
 pub mod scan;
 pub mod schema;
+pub mod segment;
 pub mod table;
 pub mod wal;
 
@@ -13,5 +14,6 @@ pub use scan::{
     ScanResult,
 };
 pub use schema::{ColumnDef, DType, Schema, SchemaError};
+pub use segment::{ImmutableSegment, Manifest, SegmentMeta, SegmentRef, MANIFEST_FILE};
 pub use table::{Table, TableError};
 pub use wal::{WalError, WalReader, WalRecord, WalWriter, WAL_MAGIC};

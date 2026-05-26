@@ -74,6 +74,8 @@ name = "bypass-db"
 version = "0.1.0"
 dependencies = [
  "bypass-io",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
