@@ -67,9 +67,24 @@ number of sealed segment files a query must inspect.
 Active rows are not included in compaction. Call `Table::flush` first when
 current active rows should be sealed before compaction.
 
+## Mmap Column Access
+
+`ImmutableSegment::map_column` opens one sealed column file as a read-only
+memory map and returns a `MappedColumn`. The mapping validates that:
+
+- the column exists in `meta.json`
+- the requested logical type matches the stored metadata
+- the file byte length equals `row_count * type_width`
+
+`MappedColumn` exposes raw mapped bytes plus scalar readers for `F64`, `I64`,
+`Timestamp`, and `FixedStr(N)`. The scalar readers copy one value out of the
+mapped bytes on demand. They intentionally do not expose typed slices such as
+`&[f64]`, because file mappings are byte-addressed and safe typed slices require
+additional alignment and aliasing proof.
+
 ## Current Boundary
 
-This phase reads sealed column files back into owned `RowBatch` values. It does
-not use `mmap` yet. The stable file format and manifest semantics come first;
-mmap-backed scan columns can be added once this layout is exercised by more
-tests and benchmarks.
+`Table::scan_time_range` still materializes sealed rows into owned `RowBatch`
+values before building `ScanResult`. The lower-level sealed segment API now has
+mmap-backed column access, so a future scan phase can keep selected scan columns
+backed by mappings instead of eagerly copying whole column files.

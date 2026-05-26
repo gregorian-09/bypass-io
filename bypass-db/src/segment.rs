@@ -1,6 +1,9 @@
+use std::fmt;
 use std::fs;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{ColumnData, RowBatch};
@@ -113,6 +116,10 @@ impl SegmentMeta {
             max_ts: self.max_ts,
         }
     }
+
+    fn column(&self, name: &str) -> Option<&ColumnMeta> {
+        self.columns.iter().find(|column| column.name == name)
+    }
 }
 
 /// Metadata for one column file.
@@ -133,6 +140,104 @@ pub struct ColumnMeta {
 pub struct ImmutableSegment {
     path: PathBuf,
     meta: SegmentMeta,
+}
+
+/// Read-only memory map for one sealed segment column.
+///
+/// `MappedColumn` keeps the operating-system mapping alive and exposes safe
+/// byte and scalar accessors. It deliberately does not expose typed slices such
+/// as `&[f64]` because a file mapping is byte-addressed and typed slice access
+/// would require additional alignment and aliasing proof.
+pub struct MappedColumn {
+    name: String,
+    dtype: DType,
+    row_count: usize,
+    mmap: Mmap,
+}
+
+impl MappedColumn {
+    /// Column name from segment metadata.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Logical type expected by the caller and validated against metadata.
+    #[must_use]
+    pub fn dtype(&self) -> &DType {
+        &self.dtype
+    }
+
+    /// Number of rows represented by this mapped column.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Raw mapped column bytes.
+    ///
+    /// The bytes follow the segment layout: little-endian 8-byte values for
+    /// numeric columns and fixed-width byte records for `FixedStr`.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    /// Read one `f64` value by row index.
+    ///
+    /// Returns `None` when this column is not `F64` or when `index` is out of
+    /// range.
+    #[must_use]
+    pub fn f64_value(&self, index: usize) -> Option<f64> {
+        if self.dtype != DType::F64 {
+            return None;
+        }
+        self.value_bytes::<8>(index).map(f64::from_le_bytes)
+    }
+
+    /// Read one `i64` or timestamp value by row index.
+    ///
+    /// Returns `None` when this column is neither `I64` nor `Timestamp`, or
+    /// when `index` is out of range.
+    #[must_use]
+    pub fn i64_value(&self, index: usize) -> Option<i64> {
+        if !matches!(self.dtype, DType::I64 | DType::Timestamp) {
+            return None;
+        }
+        self.value_bytes::<8>(index).map(i64::from_le_bytes)
+    }
+
+    /// Read one fixed-width string row as mapped bytes.
+    ///
+    /// Returns `None` when this column is not `FixedStr` or when `index` is
+    /// out of range.
+    #[must_use]
+    pub fn fixed_str_value(&self, index: usize) -> Option<&[u8]> {
+        let DType::FixedStr(width) = &self.dtype else {
+            return None;
+        };
+        let width = *width;
+        let start = index.checked_mul(width)?;
+        let end = start.checked_add(width)?;
+        self.as_bytes().get(start..end)
+    }
+
+    fn value_bytes<const N: usize>(&self, index: usize) -> Option<[u8; N]> {
+        let start = index.checked_mul(N)?;
+        let end = start.checked_add(N)?;
+        self.as_bytes().get(start..end)?.try_into().ok()
+    }
+}
+
+impl fmt::Debug for MappedColumn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MappedColumn")
+            .field("name", &self.name)
+            .field("dtype", &self.dtype)
+            .field("row_count", &self.row_count)
+            .field("byte_len", &self.mmap.len())
+            .finish()
+    }
 }
 
 impl ImmutableSegment {
@@ -192,6 +297,52 @@ impl ImmutableSegment {
             columns.push((column.name().to_string(), data));
         }
         Ok(RowBatch::from_parts(columns, self.meta.row_count))
+    }
+
+    /// Map one column file as read-only memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the column is absent, the requested type does not
+    /// match segment metadata, the column byte length does not match the row
+    /// count and type width, or the operating system rejects the mapping.
+    pub fn map_column(&self, name: &str, dtype: &DType) -> Result<MappedColumn, TableError> {
+        let column = self
+            .meta
+            .column(name)
+            .ok_or_else(|| TableError::MissingColumn {
+                column: name.to_string(),
+            })?;
+        validate_column_meta(column, dtype)?;
+        let expected_len = expected_column_bytes(dtype, self.meta.row_count)?;
+        let file = File::open(self.path.join(&column.file))
+            .map_err(|err| TableError::Io(err.to_string()))?;
+        let actual_len = file
+            .metadata()
+            .map_err(|err| TableError::Io(err.to_string()))?
+            .len();
+        if actual_len != expected_len as u64 {
+            return Err(TableError::Segment(format!(
+                "column {name} has {actual_len} bytes, expected {expected_len}"
+            )));
+        }
+        if expected_len == 0 {
+            return Err(TableError::Segment(format!(
+                "column {name} is empty and cannot be memory-mapped"
+            )));
+        }
+
+        // Safety: sealed segment column files are immutable after `seal_batch`
+        // writes them. This creates a read-only mapping, and `MappedColumn`
+        // exposes only immutable bytes or copied scalar values.
+        let mmap = unsafe { MmapOptions::new().map(&file) }
+            .map_err(|err| TableError::Io(err.to_string()))?;
+        Ok(MappedColumn {
+            name: name.to_string(),
+            dtype: dtype.clone(),
+            row_count: self.meta.row_count,
+            mmap,
+        })
     }
 }
 
@@ -339,6 +490,27 @@ fn read_column(
     }
 }
 
+fn validate_column_meta(column: &ColumnMeta, dtype: &DType) -> Result<(), TableError> {
+    let (expected_dtype, expected_width) = dtype_meta(dtype);
+    if column.dtype != expected_dtype || column.fixed_width != expected_width {
+        return Err(TableError::Segment(format!(
+            "column {} metadata is {} {:?}, expected {} {:?}",
+            column.name, column.dtype, column.fixed_width, expected_dtype, expected_width
+        )));
+    }
+    Ok(())
+}
+
+fn expected_column_bytes(dtype: &DType, row_count: usize) -> Result<usize, TableError> {
+    let width = match dtype {
+        DType::F64 | DType::I64 | DType::Timestamp => 8,
+        DType::FixedStr(width) => *width,
+    };
+    row_count
+        .checked_mul(width)
+        .ok_or_else(|| TableError::Segment("column byte count overflow".into()))
+}
+
 fn read_f64_values(bytes: &[u8], row_count: usize) -> Result<Vec<f64>, TableError> {
     if bytes.len() != row_count * 8 {
         return Err(TableError::Segment(format!(
@@ -455,6 +627,40 @@ mod tests {
         let loaded = Manifest::load(&path).unwrap();
         let loaded_segment = ImmutableSegment::load(&path, &loaded.sealed_segments[0]).unwrap();
         assert_eq!(loaded_segment.read_batch(&schema).unwrap(), batch);
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn sealed_segment_maps_columns_without_copying_file_contents() {
+        let path = table_path("mmap");
+        fs::create_dir_all(path.join("segments")).unwrap();
+        let schema = schema();
+        let batch = batch(&schema);
+        let segment = seal_batch(&path, &schema, 1, &batch).unwrap();
+
+        let price = segment.map_column("price", &DType::F64).unwrap();
+        assert_eq!(price.name(), "price");
+        assert_eq!(price.dtype(), &DType::F64);
+        assert_eq!(price.row_count(), 2);
+        assert_eq!(price.as_bytes().len(), 16);
+        assert_eq!(price.f64_value(0), Some(1.5));
+        assert_eq!(price.f64_value(1), Some(2.5));
+        assert_eq!(price.f64_value(2), None);
+        assert_eq!(price.i64_value(0), None);
+
+        let timestamp = segment.map_column("timestamp", &DType::Timestamp).unwrap();
+        assert_eq!(timestamp.i64_value(0), Some(10));
+        assert_eq!(timestamp.i64_value(1), Some(20));
+        assert_eq!(timestamp.f64_value(0), None);
+
+        let symbol = segment.map_column("symbol", &DType::FixedStr(4)).unwrap();
+        assert_eq!(symbol.fixed_str_value(0), Some(&b"MSFT"[..]));
+        assert_eq!(symbol.fixed_str_value(1), Some(&b"AAPL"[..]));
+        assert_eq!(symbol.fixed_str_value(2), None);
+
+        assert!(segment.map_column("missing", &DType::F64).is_err());
+        assert!(segment.map_column("price", &DType::I64).is_err());
 
         fs::remove_dir_all(path).unwrap();
     }

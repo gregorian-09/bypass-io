@@ -14,6 +14,8 @@ pub use scan::{
     ScanResult,
 };
 pub use schema::{ColumnDef, DType, Schema, SchemaError};
-pub use segment::{ImmutableSegment, Manifest, SegmentMeta, SegmentRef, MANIFEST_FILE};
+pub use segment::{
+    ImmutableSegment, Manifest, MappedColumn, SegmentMeta, SegmentRef, MANIFEST_FILE,
+};
 pub use table::{Table, TableError};
 pub use wal::{WalError, WalReader, WalRecord, WalWriter, WAL_MAGIC};
