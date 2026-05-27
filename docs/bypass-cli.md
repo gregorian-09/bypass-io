@@ -67,6 +67,29 @@ the latest previous record with the same benchmark name and prints a
 They are reserved for native runtime benchmark paths once the workspace can run
 against bound NVMe and NIC hardware.
 
+## Native Readiness
+
+Inspect native build status and host prerequisites:
+
+```bash
+cargo run -p bypass-cli -- doctor native
+```
+
+Check specific PCI devices and fail when hugepages are missing:
+
+```bash
+cargo run -p bypass-cli -- doctor native \
+  --spdk-pci 0000:01:00.0 \
+  --dpdk-pci 0000:02:00.0 \
+  --require-hugepages
+```
+
+The command prints `native_status` lines for SPDK and DPDK, then `host_check`
+lines for kernel, hugepages, VFIO, `vfio-pci`, and optional PCI BDFs. Missing
+hugepages are a warning by default so ordinary development machines can still
+run the command. With `--require-hugepages`, missing hugepages become a
+required failure and the command exits non-zero.
+
 ## Structured Events
 
 Add `--trace-json` before the subcommand to emit structured tracing events:

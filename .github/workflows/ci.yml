@@ -72,5 +72,8 @@ jobs:
             --compact \
             --history /tmp/bypass-ci-history.jsonl
 
+      - name: Smoke test native readiness reporting
+        run: cargo run -p bypass-cli -- doctor native
+
       - name: Verify internal ledger is not tracked
         run: test -z "$(git ls-files .internal)"

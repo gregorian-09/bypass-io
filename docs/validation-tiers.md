@@ -17,6 +17,12 @@ cargo doc --workspace --no-deps --all-features
 
 This tier does not build native SPDK or DPDK.
 
+For native readiness inspection without mutating host state:
+
+```bash
+cargo run -p bypass-cli -- doctor native
+```
+
 ## Tier 1 - Lightweight GitHub CI
 
 Workflow:
@@ -27,7 +33,8 @@ Workflow:
 
 This runs on pull requests and pushes to `main` or `feature/**` branches. It
 checks formatting, the workspace test matrix, clippy, rustdoc, a small
-`bypass-cli bench db` smoke run, and verifies `.internal` files are not tracked.
+`bypass-cli bench db` smoke run, `bypass-cli doctor native`, and verifies
+`.internal` files are not tracked.
 
 ## Tier 2 - Native Build CI
 

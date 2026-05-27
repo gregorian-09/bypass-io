@@ -32,6 +32,12 @@ Run the non-mutating host check without required hardware:
 bash tools/hardware/validate_host.sh
 ```
 
+The CLI exposes the same lightweight readiness view for day-to-day inspection:
+
+```bash
+cargo run -p bypass-cli -- doctor native
+```
+
 Run it with explicit PCI devices and required hugepages:
 
 ```bash
@@ -41,6 +47,15 @@ bash tools/hardware/validate_host.sh \
   --require-hugepages \
   --check-spdk \
   --check-dpdk
+```
+
+Or through the CLI:
+
+```bash
+cargo run -p bypass-cli -- doctor native \
+  --spdk-pci 0000:01:00.0 \
+  --dpdk-pci 0000:02:00.0 \
+  --require-hugepages
 ```
 
 The output uses one line per check:

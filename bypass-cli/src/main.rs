@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bypass_db::{ColumnData, ColumnDef, DType, RangePredicate, RowBatch, Schema, Table};
-use bypass_io::{BypassConfig, UringBackend};
+use bypass_io::{BypassConfig, DpdkBackend, SpdkBackend, UringBackend};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -25,6 +25,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Config { command } => run_config(command),
         Command::Bench { command } => run_bench(command),
+        Command::Doctor { command } => run_doctor(command),
     }
 }
 
@@ -105,6 +106,75 @@ fn run_bench(command: BenchCommand) -> Result<(), CliError> {
                 "DPDK benchmarking requires the native DPDK runtime and NIC binding phase",
             ))
         }
+    }
+}
+
+fn run_doctor(command: DoctorCommand) -> Result<(), CliError> {
+    match command {
+        DoctorCommand::Native {
+            spdk_pci,
+            dpdk_pci,
+            require_hugepages,
+        } => doctor_native(spdk_pci.as_deref(), dpdk_pci.as_deref(), require_hugepages),
+    }
+}
+
+fn doctor_native(
+    spdk_pci: Option<&str>,
+    dpdk_pci: Option<&str>,
+    require_hugepages: bool,
+) -> Result<(), CliError> {
+    let spdk = SpdkBackend::native_status();
+    let dpdk = DpdkBackend::native_status();
+    println!(
+        "native_status backend=spdk linked={} detail={:?}",
+        spdk.linked, spdk.detail
+    );
+    println!(
+        "native_status backend=dpdk linked={} detail={:?}",
+        dpdk.linked, dpdk.detail
+    );
+
+    let checks = [
+        kernel_check(),
+        hugepage_check(require_hugepages),
+        path_check(
+            "vfio",
+            Path::new("/dev/vfio/vfio"),
+            CheckState::Warn,
+            "/dev/vfio/vfio is present",
+            "/dev/vfio/vfio is not present; VFIO-bound device tests will not run",
+        ),
+        path_check(
+            "vfio_pci",
+            Path::new("/sys/bus/pci/drivers/vfio-pci"),
+            CheckState::Warn,
+            "vfio-pci driver is visible in sysfs",
+            "vfio-pci driver is not visible in sysfs",
+        ),
+        pci_check("spdk_pci", spdk_pci),
+        pci_check("dpdk_pci", dpdk_pci),
+    ];
+
+    let failures = checks
+        .iter()
+        .inspect(|check| {
+            println!(
+                "host_check check={} status={} detail={:?}",
+                check.name,
+                check.state.as_str(),
+                check.detail
+            );
+        })
+        .filter(|check| check.state == CheckState::Fail)
+        .count();
+
+    if failures == 0 {
+        println!("doctor_summary status=ok required_failures=0");
+        Ok(())
+    } else {
+        println!("doctor_summary status=fail required_failures={failures}");
+        Err(CliError::DoctorFailed { failures })
     }
 }
 
@@ -498,6 +568,160 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckState {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl CheckState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostCheck {
+    name: &'static str,
+    state: CheckState,
+    detail: String,
+}
+
+fn kernel_check() -> HostCheck {
+    let detail = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|text| format!("linux {}", text.trim()))
+        .unwrap_or_else(|_| {
+            format!(
+                "os={} arch={}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        });
+    HostCheck {
+        name: "kernel",
+        state: CheckState::Ok,
+        detail,
+    }
+}
+
+fn hugepage_check(required: bool) -> HostCheck {
+    match fs::read_to_string("/proc/meminfo") {
+        Ok(meminfo) => {
+            let total = meminfo_number(&meminfo, "HugePages_Total:").unwrap_or(0);
+            let free = meminfo_number(&meminfo, "HugePages_Free:").unwrap_or(0);
+            let size = meminfo_hugepage_size(&meminfo).unwrap_or_else(|| "unknown".to_string());
+            if total > 0 {
+                HostCheck {
+                    name: "hugepages",
+                    state: CheckState::Ok,
+                    detail: format!("total={total} free={free} size={size}"),
+                }
+            } else if required {
+                HostCheck {
+                    name: "hugepages",
+                    state: CheckState::Fail,
+                    detail: "HugePages_Total=0; configure hugepages before hardware validation"
+                        .to_string(),
+                }
+            } else {
+                HostCheck {
+                    name: "hugepages",
+                    state: CheckState::Warn,
+                    detail:
+                        "HugePages_Total=0; Rust checks can run, but hardware validation needs hugepages"
+                            .to_string(),
+                }
+            }
+        }
+        Err(err) => HostCheck {
+            name: "hugepages",
+            state: if required {
+                CheckState::Fail
+            } else {
+                CheckState::Warn
+            },
+            detail: format!("/proc/meminfo is not readable: {err}"),
+        },
+    }
+}
+
+fn meminfo_number(meminfo: &str, key: &str) -> Option<u64> {
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+}
+
+fn meminfo_hugepage_size(meminfo: &str) -> Option<String> {
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("Hugepagesize:"))
+        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|value| !value.is_empty())
+}
+
+fn path_check(
+    name: &'static str,
+    path: &Path,
+    missing_state: CheckState,
+    present_detail: &'static str,
+    missing_detail: &'static str,
+) -> HostCheck {
+    if path.exists() {
+        HostCheck {
+            name,
+            state: CheckState::Ok,
+            detail: present_detail.to_string(),
+        }
+    } else {
+        HostCheck {
+            name,
+            state: missing_state,
+            detail: missing_detail.to_string(),
+        }
+    }
+}
+
+fn pci_check(name: &'static str, bdf: Option<&str>) -> HostCheck {
+    let Some(bdf) = bdf.filter(|value| !value.trim().is_empty()) else {
+        return HostCheck {
+            name,
+            state: CheckState::Warn,
+            detail: "no PCI BDF provided".to_string(),
+        };
+    };
+    let path = Path::new("/sys/bus/pci/devices").join(bdf);
+    if !path.exists() {
+        return HostCheck {
+            name,
+            state: CheckState::Fail,
+            detail: format!("PCI device {bdf} was not found under /sys/bus/pci/devices"),
+        };
+    }
+    let driver = fs::read_link(path.join("driver")).ok().and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    });
+    match driver {
+        Some(driver) => HostCheck {
+            name,
+            state: CheckState::Ok,
+            detail: format!("device={bdf} driver={driver}"),
+        },
+        None => HostCheck {
+            name,
+            state: CheckState::Warn,
+            detail: format!("device={bdf} exists but has no bound driver"),
+        },
+    }
+}
+
 fn init_tracing(json: bool) {
     if json {
         tracing_subscriber::fmt().json().init();
@@ -529,6 +753,12 @@ enum Command {
         /// Benchmark command.
         #[command(subcommand)]
         command: BenchCommand,
+    },
+    /// Inspect native runtime and host readiness.
+    Doctor {
+        /// Doctor command.
+        #[command(subcommand)]
+        command: DoctorCommand,
     },
 }
 
@@ -621,6 +851,22 @@ enum BenchCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum DoctorCommand {
+    /// Inspect native SPDK/DPDK status and hardware host prerequisites.
+    Native {
+        /// Optional SPDK/NVMe PCI BDF, for example `0000:01:00.0`.
+        #[arg(long)]
+        spdk_pci: Option<String>,
+        /// Optional DPDK/NIC PCI BDF, for example `0000:02:00.0`.
+        #[arg(long)]
+        dpdk_pci: Option<String>,
+        /// Fail when hugepages are not configured.
+        #[arg(long)]
+        require_hugepages: bool,
+    },
+}
+
 #[derive(Debug)]
 enum CliError {
     Unsupported(&'static str),
@@ -630,6 +876,7 @@ enum CliError {
     Batch(bypass_db::batch::BatchError),
     Table(bypass_db::table::TableError),
     Json(serde_json::Error),
+    DoctorFailed { failures: usize },
 }
 
 impl CliError {
@@ -642,6 +889,7 @@ impl CliError {
             | Self::Batch(_)
             | Self::Table(_)
             | Self::Json(_) => 1,
+            Self::DoctorFailed { .. } => 2,
         }
     }
 }
@@ -656,6 +904,9 @@ impl fmt::Display for CliError {
             Self::Batch(err) => write!(f, "{err}"),
             Self::Table(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "{err}"),
+            Self::DoctorFailed { failures } => {
+                write!(f, "native doctor found {failures} required failure(s)")
+            }
         }
     }
 }
@@ -696,7 +947,7 @@ impl From<bypass_db::table::TableError> for CliError {
 mod tests {
     use std::time::Duration;
 
-    use super::parse_duration;
+    use super::{meminfo_hugepage_size, meminfo_number, parse_duration, CheckState};
 
     #[test]
     fn parse_duration_supports_common_suffixes() {
@@ -705,5 +956,24 @@ mod tests {
         assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
         assert_eq!(parse_duration("1h"), Ok(Duration::from_secs(3600)));
         assert!(parse_duration("bad").is_err());
+    }
+
+    #[test]
+    fn meminfo_helpers_parse_hugepage_fields() {
+        let meminfo = "\
+HugePages_Total:    1024
+HugePages_Free:      900
+Hugepagesize:       2048 kB
+";
+        assert_eq!(meminfo_number(meminfo, "HugePages_Total:"), Some(1024));
+        assert_eq!(meminfo_number(meminfo, "HugePages_Free:"), Some(900));
+        assert_eq!(meminfo_hugepage_size(meminfo).as_deref(), Some("2048 kB"));
+    }
+
+    #[test]
+    fn check_state_has_stable_text() {
+        assert_eq!(CheckState::Ok.as_str(), "ok");
+        assert_eq!(CheckState::Warn.as_str(), "warn");
+        assert_eq!(CheckState::Fail.as_str(), "fail");
     }
 }
