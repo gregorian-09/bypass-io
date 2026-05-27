@@ -4,6 +4,8 @@
 while native SPDK/DPDK validation remains available when the right environment
 exists.
 
+For a high-level implementation map, see `docs/project-status.md`.
+
 ## Tier 0 - Local Rust Checks
 
 Run before committing normal Rust changes:

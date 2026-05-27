@@ -9,6 +9,9 @@ scaffolds compile only when the build script enables `bypass_io_native_spdk` or
 That keeps the project honest: native link flags can be validated before the
 unsafe call paths are trusted.
 
+For the overall project status and remaining implementation phases, see
+`docs/project-status.md`.
+
 ## SPDK Adapter Boundary
 
 The SPDK adapter scaffold lives inside:

@@ -1,0 +1,81 @@
+# bypass-io
+
+`bypass-io` is a Rust systems workspace for low-latency I/O experiments:
+kernel-adjacent file I/O, SPDK-style NVMe readiness, DPDK-style packet I/O
+readiness, and an embedded columnar time-series layer.
+
+The project is intentionally staged. Normal Rust builds remain lightweight and
+do not require native SPDK/DPDK libraries, hugepages, or bound PCI devices. The
+native paths are exposed as explicit validation surfaces until unsafe hardware
+I/O is implemented and verified on dedicated machines.
+
+## Workspace
+
+- `bypass-io`: core buffers, rings, reactors, configuration, `io_uring`, SPDK,
+  and DPDK backend surfaces.
+- `bypass-db`: embedded columnar table storage with WAL, sealed segments,
+  mmap-backed scans, compaction, and SIMD-assisted filtering.
+- `bypass-cli`: configuration, benchmark, benchmark-history, and native
+  readiness commands.
+
+## Quick Start
+
+Run the default validation set:
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo doc --workspace --no-deps --all-features
+```
+
+Inspect native readiness without mutating the host:
+
+```bash
+cargo run -p bypass-cli -- doctor native
+```
+
+Run a small database benchmark:
+
+```bash
+cargo run -p bypass-cli -- bench db \
+  --path /tmp/bypass-db \
+  --rows-per-batch 1000 \
+  --batches 10 \
+  --scan-iterations 2 \
+  --compact
+```
+
+## Native Boundary
+
+The SPDK and DPDK Rust features compile validation surfaces by default. They do
+not link native C libraries unless the native link-check environment variables
+are set:
+
+```bash
+BYPASS_IO_NATIVE_SPDK=1 SPDK_LIB_DIR=/opt/spdk/build/lib \
+  cargo test -p bypass-io --features spdk
+
+BYPASS_IO_NATIVE_DPDK=1 \
+  cargo test -p bypass-io --features dpdk
+```
+
+Even when native link checks pass, real SPDK/DPDK I/O remains disabled until
+the native runtime adapters are completed and hardware-tested.
+
+## Documentation
+
+- `docs/project-status.md`: implementation status and remaining work.
+- `docs/validation-tiers.md`: local, CI, native, hardware, and performance
+  validation tiers.
+- `docs/native-runtime-adapters.md`: unsafe native adapter boundary and safety
+  requirements.
+- `docs/native-linking.md`: opt-in SPDK/DPDK native link-check commands.
+- `docs/hardware-validation.md`: host readiness and self-hosted runner usage.
+- `docs/bypass-cli.md`: CLI commands.
+- `docs/bypass-db-storage.md`: columnar storage and scan design.
+
+## Internal Ledger
+
+`.internal/` contains local-only project notes, specifications, and the learning
+ledger. It is intentionally ignored by Git and should not be pushed.
