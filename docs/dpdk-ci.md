@@ -60,13 +60,24 @@ cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+To validate native DPDK link flags on a host that already provides a DPDK
+`pkg-config` file, use the opt-in build-script path:
+
+```bash
+BYPASS_IO_NATIVE_DPDK=1 \
+cargo test -p bypass-io --features dpdk
+```
+
+If the package metadata is not in the default search path, set
+`PKG_CONFIG_PATH`. See `docs/native-linking.md` for details.
+
 ## Native Runtime Status
 
-`DpdkBackend::native_status()` reports whether the current Rust build links a
-native DPDK adapter. The current repository reports `linked = false`. That is
-intentional until a machine with DPDK headers/libraries, configured hugepages,
-NIC binding, and a safe mbuf ownership design is available for hardware
-validation.
+`DpdkBackend::native_status()` reports whether the current Rust build enabled
+native DPDK link flags. The default repository build reports `linked = false`.
+With `BYPASS_IO_NATIVE_DPDK=1`, a successful build reports `linked = true`, but
+the safe runtime adapter still returns `RuntimeUnavailable` until native I/O
+call paths are implemented and hardware-tested.
 
 The Rust-side backend validates EAL/port configuration, queue bounds, target
 routing, packet parsing, multicast flow-rule inputs, polling delegation, and

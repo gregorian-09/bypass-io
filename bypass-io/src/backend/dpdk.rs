@@ -228,6 +228,18 @@ impl fmt::Debug for DpdkBackend {
 impl DpdkBackend {
     /// Return the native DPDK runtime integration status for this build.
     #[must_use]
+    #[cfg(bypass_io_native_dpdk)]
+    pub const fn native_status() -> DpdkNativeStatus {
+        DpdkNativeStatus {
+            linked: true,
+            detail:
+                "native DPDK link flags are active; safe runtime adapter is still validation-only",
+        }
+    }
+
+    /// Return the native DPDK runtime integration status for this build.
+    #[must_use]
+    #[cfg(not(bypass_io_native_dpdk))]
     pub const fn native_status() -> DpdkNativeStatus {
         DpdkNativeStatus {
             linked: false,
@@ -240,7 +252,7 @@ impl DpdkBackend {
     /// # Errors
     ///
     /// Returns [`DpdkError::RuntimeUnavailable`] until the native DPDK runtime
-    /// adapter is linked into the crate.
+    /// adapter is implemented.
     pub fn init(config: DpdkConfig) -> Result<Self, DpdkError> {
         let backend = Self::unavailable(config);
         backend.runtime.init(backend.config())?;
@@ -872,8 +884,18 @@ impl DpdkRuntime for UnavailableDpdkRuntime {
 
 fn runtime_unavailable() -> DpdkError {
     DpdkError::RuntimeUnavailable {
-        detail: "native DPDK runtime is not linked",
+        detail: runtime_unavailable_detail(),
     }
+}
+
+#[cfg(bypass_io_native_dpdk)]
+const fn runtime_unavailable_detail() -> &'static str {
+    "native DPDK link flags are active, but the safe runtime adapter is not implemented"
+}
+
+#[cfg(not(bypass_io_native_dpdk))]
+const fn runtime_unavailable_detail() -> &'static str {
+    "native DPDK runtime is not linked"
 }
 
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -1118,6 +1140,7 @@ mod tests {
 
     #[test]
     fn unavailable_backend_reports_runtime_unavailable() {
+        #[cfg(not(bypass_io_native_dpdk))]
         assert_eq!(
             DpdkBackend::native_status(),
             super::DpdkNativeStatus {
@@ -1125,10 +1148,27 @@ mod tests {
                 detail: "native DPDK symbols are not linked; Rust validation runtime is active"
             }
         );
+        #[cfg(bypass_io_native_dpdk)]
+        assert_eq!(
+            DpdkBackend::native_status(),
+            super::DpdkNativeStatus {
+                linked: true,
+                detail: "native DPDK link flags are active; safe runtime adapter is still validation-only"
+            }
+        );
+        #[cfg(not(bypass_io_native_dpdk))]
         assert_eq!(
             DpdkBackend::init(config()).unwrap_err(),
             DpdkError::RuntimeUnavailable {
                 detail: "native DPDK runtime is not linked"
+            }
+        );
+        #[cfg(bypass_io_native_dpdk)]
+        assert_eq!(
+            DpdkBackend::init(config()).unwrap_err(),
+            DpdkError::RuntimeUnavailable {
+                detail:
+                    "native DPDK link flags are active, but the safe runtime adapter is not implemented"
             }
         );
     }

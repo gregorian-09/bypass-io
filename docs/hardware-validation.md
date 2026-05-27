@@ -83,6 +83,9 @@ The workflow runs:
 
 This phase validates host readiness and Rust feature gates. True hardware I/O
 still requires a later native-runtime phase where `SpdkBackend::native_status()`
-or `DpdkBackend::native_status()` reports `linked = true`, native symbols are
-actually called, and device-specific I/O tests are executed against bound
-hardware.
+or `DpdkBackend::native_status()` reports `linked = true`, native link checks
+pass on the target host, native symbols are actually called, and
+device-specific I/O tests are executed against bound hardware.
+
+See `docs/native-linking.md` for the opt-in native link-check environment
+variables.

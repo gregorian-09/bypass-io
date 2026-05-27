@@ -59,13 +59,25 @@ cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+To validate native SPDK link flags on a host that already built SPDK, use the
+opt-in build-script path:
+
+```bash
+BYPASS_IO_NATIVE_SPDK=1 \
+SPDK_LIB_DIR=/path/to/spdk/build/lib \
+cargo test -p bypass-io --features spdk
+```
+
+See `docs/native-linking.md` for optional `SPDK_LIBS`, `SPDK_SYSTEM_LIBS`, and
+`SPDK_LINK_KIND` overrides.
+
 ## Native Runtime Status
 
-`SpdkBackend::native_status()` reports whether the current Rust build links a
-native SPDK adapter. The current repository reports `linked = false`. That is
-intentional until a machine with SPDK headers/libraries, configured hugepages,
-VFIO/UIO permissions, and a safe completion-ownership design is available for
-hardware validation.
+`SpdkBackend::native_status()` reports whether the current Rust build enabled
+native SPDK link flags. The default repository build reports `linked = false`.
+With `BYPASS_IO_NATIVE_SPDK=1`, a successful build reports `linked = true`, but
+the safe runtime adapter still returns `RuntimeUnavailable` until native I/O
+call paths are implemented and hardware-tested.
 
 The Rust-side backend validates namespace metadata, DMA-buffer eligibility,
 target routing, LBA conversion, queue-pair polling delegation, and error

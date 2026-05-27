@@ -37,6 +37,18 @@ impl fmt::Debug for SpdkBackend {
 impl SpdkBackend {
     /// Return the native SPDK runtime integration status for this build.
     #[must_use]
+    #[cfg(bypass_io_native_spdk)]
+    pub const fn native_status() -> SpdkNativeStatus {
+        SpdkNativeStatus {
+            linked: true,
+            detail:
+                "native SPDK link flags are active; safe runtime adapter is still validation-only",
+        }
+    }
+
+    /// Return the native SPDK runtime integration status for this build.
+    #[must_use]
+    #[cfg(not(bypass_io_native_spdk))]
     pub const fn native_status() -> SpdkNativeStatus {
         SpdkNativeStatus {
             linked: false,
@@ -49,11 +61,11 @@ impl SpdkBackend {
     /// # Errors
     ///
     /// Returns [`SpdkError::RuntimeUnavailable`] until the native SPDK runtime
-    /// adapter is linked into the crate. This keeps the `spdk` feature useful
-    /// for API and validation work on machines without SPDK installed.
+    /// adapter is implemented. This keeps the `spdk` feature useful for API and
+    /// validation work on machines without SPDK installed.
     pub fn probe_and_init() -> Result<Self, SpdkError> {
         Err(SpdkError::RuntimeUnavailable {
-            detail: "native SPDK runtime is not linked",
+            detail: runtime_unavailable_detail(),
         })
     }
 
@@ -653,8 +665,18 @@ impl SpdkRuntime for UnavailableSpdkRuntime {
 
 fn runtime_unavailable() -> SpdkError {
     SpdkError::RuntimeUnavailable {
-        detail: "native SPDK runtime is not linked",
+        detail: runtime_unavailable_detail(),
     }
+}
+
+#[cfg(bypass_io_native_spdk)]
+const fn runtime_unavailable_detail() -> &'static str {
+    "native SPDK link flags are active, but the safe runtime adapter is not implemented"
+}
+
+#[cfg(not(bypass_io_native_spdk))]
+const fn runtime_unavailable_detail() -> &'static str {
+    "native SPDK runtime is not linked"
 }
 
 fn spdk_segments<'a>(
@@ -852,6 +874,7 @@ mod tests {
 
     #[test]
     fn probe_reports_unavailable_without_native_spdk_runtime() {
+        #[cfg(not(bypass_io_native_spdk))]
         assert_eq!(
             SpdkBackend::native_status(),
             super::SpdkNativeStatus {
@@ -859,10 +882,27 @@ mod tests {
                 detail: "native SPDK symbols are not linked; Rust validation runtime is active"
             }
         );
+        #[cfg(bypass_io_native_spdk)]
+        assert_eq!(
+            SpdkBackend::native_status(),
+            super::SpdkNativeStatus {
+                linked: true,
+                detail: "native SPDK link flags are active; safe runtime adapter is still validation-only"
+            }
+        );
+        #[cfg(not(bypass_io_native_spdk))]
         assert_eq!(
             SpdkBackend::probe_and_init().unwrap_err(),
             SpdkError::RuntimeUnavailable {
                 detail: "native SPDK runtime is not linked"
+            }
+        );
+        #[cfg(bypass_io_native_spdk)]
+        assert_eq!(
+            SpdkBackend::probe_and_init().unwrap_err(),
+            SpdkError::RuntimeUnavailable {
+                detail:
+                    "native SPDK link flags are active, but the safe runtime adapter is not implemented"
             }
         );
     }

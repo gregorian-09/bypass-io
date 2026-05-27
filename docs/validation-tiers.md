@@ -52,6 +52,9 @@ docker/dpdk/Dockerfile
 
 See `docs/containers.md` for build and run commands.
 
+Native link checks are also opt-in through environment variables so ordinary
+`--all-features` builds remain lightweight. See `docs/native-linking.md`.
+
 ## Tier 3 - Hardware Validation
 
 Manual workflow:
