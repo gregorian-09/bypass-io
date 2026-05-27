@@ -54,6 +54,18 @@ See `docs/containers.md` for build and run commands.
 
 ## Tier 3 - Hardware Validation
 
+Manual workflow:
+
+```text
+.github/workflows/hardware-validation.yml
+```
+
+Local readiness script:
+
+```text
+tools/hardware/validate_host.sh
+```
+
 Hardware validation requires a dedicated machine or self-hosted runner with:
 
 - native SPDK or DPDK libraries
@@ -64,6 +76,10 @@ Hardware validation requires a dedicated machine or self-hosted runner with:
 The current public Rust APIs expose `SpdkBackend::native_status()` and
 `DpdkBackend::native_status()` so callers can detect whether a build actually
 links native runtime symbols.
+
+See `docs/hardware-validation.md` for the self-hosted runner labels, local
+readiness commands, and the current boundary between host-readiness validation
+and real native device I/O.
 
 ## Tier 4 - Performance Regression Tracking
 

@@ -1,0 +1,92 @@
+name: Hardware Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      spdk_pci:
+        description: "Optional SPDK/NVMe PCI BDF, for example 0000:01:00.0"
+        required: false
+        default: ""
+      dpdk_pci:
+        description: "Optional DPDK/NIC PCI BDF, for example 0000:02:00.0"
+        required: false
+        default: ""
+      require_hugepages:
+        description: "Fail the host-readiness check if hugepages are not configured"
+        required: true
+        type: boolean
+        default: true
+      run_spdk_checks:
+        description: "Run cargo test --features spdk on the hardware runner"
+        required: true
+        type: boolean
+        default: true
+      run_dpdk_checks:
+        description: "Run cargo test --features dpdk on the hardware runner"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardware-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  host-readiness:
+    name: Validate self-hosted hardware runner
+    runs-on: [self-hosted, linux, bypass-hardware]
+    timeout-minutes: 60
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Validate all Rust features
+        run: cargo test --workspace --all-features
+
+      - name: Lint all Rust features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Validate hardware host readiness
+        shell: bash
+        run: |
+          args=()
+
+          if [[ -n "${{ inputs.spdk_pci }}" ]]; then
+            args+=(--spdk-pci "${{ inputs.spdk_pci }}")
+          fi
+
+          if [[ -n "${{ inputs.dpdk_pci }}" ]]; then
+            args+=(--dpdk-pci "${{ inputs.dpdk_pci }}")
+          fi
+
+          if [[ "${{ inputs.require_hugepages }}" == "true" ]]; then
+            args+=(--require-hugepages)
+          fi
+
+          if [[ "${{ inputs.run_spdk_checks }}" == "true" ]]; then
+            args+=(--check-spdk)
+          fi
+
+          if [[ "${{ inputs.run_dpdk_checks }}" == "true" ]]; then
+            args+=(--check-dpdk)
+          fi
+
+          bash tools/hardware/validate_host.sh "${args[@]}"
+
+      - name: Verify internal ledger is not tracked
+        run: test -z "$(git ls-files .internal)"
