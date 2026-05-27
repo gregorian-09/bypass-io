@@ -232,8 +232,7 @@ impl DpdkBackend {
     pub const fn native_status() -> DpdkNativeStatus {
         DpdkNativeStatus {
             linked: true,
-            detail:
-                "native DPDK link flags are active; safe runtime adapter is still validation-only",
+            detail: "native DPDK link flags are active; native runtime adapter scaffold is compiled with I/O disabled",
         }
     }
 
@@ -253,6 +252,23 @@ impl DpdkBackend {
     ///
     /// Returns [`DpdkError::RuntimeUnavailable`] until the native DPDK runtime
     /// adapter is implemented.
+    #[cfg(bypass_io_native_dpdk)]
+    pub fn init(config: DpdkConfig) -> Result<Self, DpdkError> {
+        let backend = Self {
+            config,
+            runtime: Arc::new(native::NativeDpdkRuntime::new()),
+        };
+        backend.runtime.init(backend.config())?;
+        Ok(backend)
+    }
+
+    /// Initialize DPDK and start the configured Ethernet port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DpdkError::RuntimeUnavailable`] until the native DPDK runtime
+    /// adapter is implemented.
+    #[cfg(not(bypass_io_native_dpdk))]
     pub fn init(config: DpdkConfig) -> Result<Self, DpdkError> {
         let backend = Self::unavailable(config);
         backend.runtime.init(backend.config())?;
@@ -890,7 +906,7 @@ fn runtime_unavailable() -> DpdkError {
 
 #[cfg(bypass_io_native_dpdk)]
 const fn runtime_unavailable_detail() -> &'static str {
-    "native DPDK link flags are active, but the safe runtime adapter is not implemented"
+    "native DPDK adapter scaffold is compiled, but DPDK I/O calls are disabled pending safety audit"
 }
 
 #[cfg(not(bypass_io_native_dpdk))]
@@ -902,6 +918,128 @@ const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: u8 = 20;
 const UDP_HEADER_LEN: usize = 8;
 const IP_PROTO_UDP: u8 = 17;
+
+#[cfg(bypass_io_native_dpdk)]
+mod native {
+    use super::{
+        runtime_unavailable, DpdkConfig, DpdkError, DpdkRuntime, MulticastGroup, Packet, QueueId,
+        UnavailableDpdkRuntime,
+    };
+    use crate::buf::PooledBuf;
+    use crate::ffi::dpdk_sys;
+
+    /// Native DPDK adapter scaffold.
+    ///
+    /// This type exists only when the build script has enabled
+    /// `bypass_io_native_dpdk`. It reserves the implementation boundary for EAL,
+    /// ethdev, mbuf, and flow-rule calls, but every method intentionally returns
+    /// [`DpdkError::RuntimeUnavailable`] until the unsafe mbuf ownership and
+    /// hardware validation plan is complete.
+    pub(super) struct NativeDpdkRuntime {
+        fallback: UnavailableDpdkRuntime,
+    }
+
+    impl NativeDpdkRuntime {
+        pub(super) const fn new() -> Self {
+            Self {
+                fallback: UnavailableDpdkRuntime,
+            }
+        }
+
+        pub(super) const fn required_apis() -> &'static [&'static str] {
+            &[
+                "rte_eal_init",
+                "rte_pktmbuf_pool_create",
+                "rte_eth_dev_configure",
+                "rte_eth_rx_queue_setup",
+                "rte_eth_tx_queue_setup",
+                "rte_eth_dev_start",
+                "rte_eth_rx_burst",
+                "rte_eth_tx_burst",
+                "rte_flow_create",
+            ]
+        }
+    }
+
+    impl DpdkRuntime for NativeDpdkRuntime {
+        fn init(&self, _config: &DpdkConfig) -> Result<(), DpdkError> {
+            let _apis = Self::required_apis();
+            let _ffi_markers = (
+                core::mem::size_of::<dpdk_sys::rte_mempool>(),
+                core::mem::size_of::<dpdk_sys::rte_mbuf>(),
+                core::mem::size_of::<dpdk_sys::rte_flow>(),
+            );
+            Err(runtime_unavailable())
+        }
+
+        fn rx_burst(
+            &self,
+            port_id: u16,
+            queue: QueueId,
+            max_packets: u16,
+        ) -> Result<Vec<Packet>, DpdkError> {
+            self.fallback.rx_burst(port_id, queue, max_packets)
+        }
+
+        fn tx_burst(
+            &self,
+            port_id: u16,
+            queue: QueueId,
+            packets: &[Packet],
+        ) -> Result<u16, DpdkError> {
+            self.fallback.tx_burst(port_id, queue, packets)
+        }
+
+        fn join_multicast(
+            &self,
+            port_id: u16,
+            group: MulticastGroup,
+            queue: QueueId,
+        ) -> Result<(), DpdkError> {
+            self.fallback.join_multicast(port_id, group, queue)
+        }
+
+        fn read_packet(
+            &self,
+            port_id: u16,
+            queue: QueueId,
+            buf: &mut PooledBuf,
+        ) -> Result<usize, DpdkError> {
+            self.fallback.read_packet(port_id, queue, buf)
+        }
+
+        fn write_packet(
+            &self,
+            port_id: u16,
+            queue: QueueId,
+            buf: &PooledBuf,
+        ) -> Result<usize, DpdkError> {
+            self.fallback.write_packet(port_id, queue, buf)
+        }
+
+        fn read_packets(
+            &self,
+            port_id: u16,
+            queue: QueueId,
+            bufs: &mut [PooledBuf],
+        ) -> Result<usize, DpdkError> {
+            self.fallback.read_packets(port_id, queue, bufs)
+        }
+
+        fn write_packets(
+            &self,
+            port_id: u16,
+            queue: QueueId,
+            bufs: &[PooledBuf],
+        ) -> Result<usize, DpdkError> {
+            self.fallback.write_packets(port_id, queue, bufs)
+        }
+
+        fn poll_port(&self, port_id: u16) -> usize {
+            self.fallback.poll_port(port_id)
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1153,7 +1291,7 @@ mod tests {
             DpdkBackend::native_status(),
             super::DpdkNativeStatus {
                 linked: true,
-                detail: "native DPDK link flags are active; safe runtime adapter is still validation-only"
+                detail: "native DPDK link flags are active; native runtime adapter scaffold is compiled with I/O disabled"
             }
         );
         #[cfg(not(bypass_io_native_dpdk))]
@@ -1168,7 +1306,7 @@ mod tests {
             DpdkBackend::init(config()).unwrap_err(),
             DpdkError::RuntimeUnavailable {
                 detail:
-                    "native DPDK link flags are active, but the safe runtime adapter is not implemented"
+                    "native DPDK adapter scaffold is compiled, but DPDK I/O calls are disabled pending safety audit"
             }
         );
     }

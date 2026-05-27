@@ -70,7 +70,7 @@ When the native link check is not enabled, `SpdkBackend::native_status()` and
 
 When the corresponding native link check is enabled and the build succeeds,
 the status reports `linked = true`, but the detail string still states that the
-safe runtime adapter is validation-only. This distinction matters:
+native runtime adapter scaffold has I/O disabled. This distinction matters:
 
 - `linked = true`: Cargo accepted native link flags for the build.
 - `RuntimeUnavailable`: the Rust backend still does not submit real native I/O.
@@ -78,3 +78,6 @@ safe runtime adapter is validation-only. This distinction matters:
 The next native-runtime phase must replace the validation runtime with audited
 SPDK/DPDK call paths before benchmarks or applications rely on real hardware
 I/O.
+
+See `docs/native-runtime-adapters.md` for the adapter scaffolds and safety
+requirements that must be satisfied before native I/O is enabled.

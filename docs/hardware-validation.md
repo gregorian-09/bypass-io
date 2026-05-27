@@ -88,4 +88,5 @@ pass on the target host, native symbols are actually called, and
 device-specific I/O tests are executed against bound hardware.
 
 See `docs/native-linking.md` for the opt-in native link-check environment
-variables.
+variables, and `docs/native-runtime-adapters.md` for the unsafe adapter boundary
+that must be completed before real hardware I/O is enabled.

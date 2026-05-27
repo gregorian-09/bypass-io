@@ -41,8 +41,7 @@ impl SpdkBackend {
     pub const fn native_status() -> SpdkNativeStatus {
         SpdkNativeStatus {
             linked: true,
-            detail:
-                "native SPDK link flags are active; safe runtime adapter is still validation-only",
+            detail: "native SPDK link flags are active; native runtime adapter scaffold is compiled with I/O disabled",
         }
     }
 
@@ -63,6 +62,19 @@ impl SpdkBackend {
     /// Returns [`SpdkError::RuntimeUnavailable`] until the native SPDK runtime
     /// adapter is implemented. This keeps the `spdk` feature useful for API and
     /// validation work on machines without SPDK installed.
+    #[cfg(bypass_io_native_spdk)]
+    pub fn probe_and_init() -> Result<Self, SpdkError> {
+        native::probe_and_init()
+    }
+
+    /// Probe PCIe NVMe devices and initialize SPDK.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpdkError::RuntimeUnavailable`] until the native SPDK runtime
+    /// adapter is implemented. This keeps the `spdk` feature useful for API and
+    /// validation work on machines without SPDK installed.
+    #[cfg(not(bypass_io_native_spdk))]
     pub fn probe_and_init() -> Result<Self, SpdkError> {
         Err(SpdkError::RuntimeUnavailable {
             detail: runtime_unavailable_detail(),
@@ -671,7 +683,7 @@ fn runtime_unavailable() -> SpdkError {
 
 #[cfg(bypass_io_native_spdk)]
 const fn runtime_unavailable_detail() -> &'static str {
-    "native SPDK link flags are active, but the safe runtime adapter is not implemented"
+    "native SPDK adapter scaffold is compiled, but SPDK I/O calls are disabled pending safety audit"
 }
 
 #[cfg(not(bypass_io_native_spdk))]
@@ -700,6 +712,106 @@ fn total_pooled_len<'a>(mut bufs: impl Iterator<Item = &'a PooledBuf>) -> Result
             .checked_add(buf.len())
             .ok_or(SpdkError::LengthOverflow)
     })
+}
+
+#[cfg(bypass_io_native_spdk)]
+mod native {
+    use super::{
+        runtime_unavailable, IoQueuePair, NvmeNamespace, SpdkBackend, SpdkBufferSegment, SpdkError,
+        SpdkRuntime, UnavailableSpdkRuntime,
+    };
+    use crate::ffi::spdk_sys;
+
+    /// Native SPDK adapter scaffold.
+    ///
+    /// This type exists only when the build script has enabled
+    /// `bypass_io_native_spdk`. It documents the exact place where future SPDK C
+    /// calls will live, but it deliberately delegates every operation to the
+    /// unavailable runtime until the unsafe completion and DMA ownership model
+    /// is implemented and tested on hardware.
+    pub(super) struct NativeSpdkRuntime {
+        fallback: UnavailableSpdkRuntime,
+    }
+
+    impl NativeSpdkRuntime {
+        pub(super) const fn new() -> Self {
+            Self {
+                fallback: UnavailableSpdkRuntime,
+            }
+        }
+
+        pub(super) const fn required_symbols() -> &'static [&'static str] {
+            &[
+                "spdk_nvme_probe",
+                "spdk_nvme_ctrlr_alloc_io_qpair",
+                "spdk_nvme_ns_cmd_read",
+                "spdk_nvme_ns_cmd_write",
+                "spdk_nvme_ns_cmd_flush",
+                "spdk_nvme_qpair_process_completions",
+            ]
+        }
+    }
+
+    impl SpdkRuntime for NativeSpdkRuntime {
+        fn read(
+            &self,
+            namespace: &NvmeNamespace,
+            qpair: &IoQueuePair,
+            segment: SpdkBufferSegment,
+            range: super::NvmeLbaRange,
+        ) -> Result<usize, SpdkError> {
+            self.fallback.read(namespace, qpair, segment, range)
+        }
+
+        fn write(
+            &self,
+            namespace: &NvmeNamespace,
+            qpair: &IoQueuePair,
+            segment: SpdkBufferSegment,
+            range: super::NvmeLbaRange,
+        ) -> Result<usize, SpdkError> {
+            self.fallback.write(namespace, qpair, segment, range)
+        }
+
+        fn readv(
+            &self,
+            namespace: &NvmeNamespace,
+            qpair: &IoQueuePair,
+            segments: &[SpdkBufferSegment],
+            range: super::NvmeLbaRange,
+        ) -> Result<usize, SpdkError> {
+            self.fallback.readv(namespace, qpair, segments, range)
+        }
+
+        fn writev(
+            &self,
+            namespace: &NvmeNamespace,
+            qpair: &IoQueuePair,
+            segments: &[SpdkBufferSegment],
+            range: super::NvmeLbaRange,
+        ) -> Result<usize, SpdkError> {
+            self.fallback.writev(namespace, qpair, segments, range)
+        }
+
+        fn flush(&self, namespace: &NvmeNamespace, qpair: &IoQueuePair) -> Result<(), SpdkError> {
+            self.fallback.flush(namespace, qpair)
+        }
+
+        fn process_completions(&self, qpair: &IoQueuePair, max_completions: u32) -> usize {
+            self.fallback.process_completions(qpair, max_completions)
+        }
+    }
+
+    pub(super) fn probe_and_init() -> Result<SpdkBackend, SpdkError> {
+        let _runtime = NativeSpdkRuntime::new();
+        let _symbols = NativeSpdkRuntime::required_symbols();
+        let _ffi_markers = (
+            core::mem::size_of::<spdk_sys::spdk_nvme_ctrlr>(),
+            core::mem::size_of::<spdk_sys::spdk_nvme_ns>(),
+            core::mem::size_of::<spdk_sys::spdk_nvme_qpair>(),
+        );
+        Err(runtime_unavailable())
+    }
 }
 
 #[cfg(test)]
@@ -887,7 +999,7 @@ mod tests {
             SpdkBackend::native_status(),
             super::SpdkNativeStatus {
                 linked: true,
-                detail: "native SPDK link flags are active; safe runtime adapter is still validation-only"
+                detail: "native SPDK link flags are active; native runtime adapter scaffold is compiled with I/O disabled"
             }
         );
         #[cfg(not(bypass_io_native_spdk))]
@@ -902,7 +1014,7 @@ mod tests {
             SpdkBackend::probe_and_init().unwrap_err(),
             SpdkError::RuntimeUnavailable {
                 detail:
-                    "native SPDK link flags are active, but the safe runtime adapter is not implemented"
+                    "native SPDK adapter scaffold is compiled, but SPDK I/O calls are disabled pending safety audit"
             }
         );
     }

@@ -54,6 +54,8 @@ See `docs/containers.md` for build and run commands.
 
 Native link checks are also opt-in through environment variables so ordinary
 `--all-features` builds remain lightweight. See `docs/native-linking.md`.
+The native adapter scaffolds and safety requirements are documented in
+`docs/native-runtime-adapters.md`.
 
 ## Tier 3 - Hardware Validation
 
