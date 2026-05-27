@@ -19,3 +19,17 @@ Normal builds do not require SPDK, DPDK, hugepages, or bound devices. Native
 SPDK/DPDK paths are intentionally staged: link checks and adapter scaffolds are
 available, but real hardware I/O remains disabled until the unsafe call paths
 are completed and validated on dedicated hardware.
+
+## Example
+
+Compile the crate example:
+
+```bash
+cargo check -p bypass-io --examples --all-features
+```
+
+Run the `io_uring` example on a host that permits `io_uring_setup(2)`:
+
+```bash
+cargo run -p bypass-io --example uring_write
+```

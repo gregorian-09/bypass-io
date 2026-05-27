@@ -31,6 +31,7 @@ where the boundaries still are.
 - SIMD-assisted filtering for supported x86_64 scan paths with scalar
   fallbacks.
 - Segment compaction.
+- Runnable table lifecycle example.
 
 ### `bypass-cli`
 
@@ -41,10 +42,15 @@ where the boundaries still are.
 - Native readiness doctor for SPDK/DPDK status and host prerequisites.
 - Structured tracing output through `--trace-json`.
 
+### Examples
+
+- `bypass-io/examples/uring_write.rs`
+- `bypass-db/examples/table_lifecycle.rs`
+
 ### Validation and Operations
 
 - Lightweight Rust CI for formatting, tests, clippy, docs, DB smoke benchmark,
-  native readiness smoke, and `.internal` tracking guard.
+  example compilation, native readiness smoke, and `.internal` tracking guard.
 - Manual native SPDK and DPDK build workflows.
 - Optional Docker recipes for Rust, SPDK, and DPDK validation environments.
 - Manual self-hosted hardware-validation workflow.

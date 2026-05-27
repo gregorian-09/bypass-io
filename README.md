@@ -46,6 +46,18 @@ cargo run -p bypass-cli -- bench db \
   --compact
 ```
 
+Compile public examples:
+
+```bash
+cargo check --workspace --examples --all-features
+```
+
+Run the table lifecycle example:
+
+```bash
+cargo run -p bypass-db --example table_lifecycle
+```
+
 ## Native Boundary
 
 The SPDK and DPDK Rust features compile validation surfaces by default. They do
@@ -74,6 +86,13 @@ the native runtime adapters are completed and hardware-tested.
 - `docs/hardware-validation.md`: host readiness and self-hosted runner usage.
 - `docs/bypass-cli.md`: CLI commands.
 - `docs/bypass-db-storage.md`: columnar storage and scan design.
+
+## Examples
+
+- `bypass-io/examples/uring_write.rs`: guarded `io_uring` write/read/fsync flow
+  against a temporary file.
+- `bypass-db/examples/table_lifecycle.rs`: schema creation, append, flush,
+  mmap-backed scan, compaction, and cleanup.
 
 ## Internal Ledger
 
