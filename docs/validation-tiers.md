@@ -41,6 +41,17 @@ Manual workflows:
 These are intentionally `workflow_dispatch` only. They build large native
 dependencies and should not run on every pull request.
 
+Optional container recipes are available under `docker/` for reproducible local
+or self-hosted-runner environments:
+
+```text
+docker/rust/Dockerfile
+docker/spdk/Dockerfile
+docker/dpdk/Dockerfile
+```
+
+See `docs/containers.md` for build and run commands.
+
 ## Tier 3 - Hardware Validation
 
 Hardware validation requires a dedicated machine or self-hosted runner with:
