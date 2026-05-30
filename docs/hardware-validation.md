@@ -92,15 +92,40 @@ The workflow runs:
 - `cargo test --workspace --all-features`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `tools/hardware/validate_host.sh` with the dispatch inputs
-- `test -z "$(git ls-files .internal)"`
+
+## Validation Procedure
+
+Use this sequence to validate the hardware path:
+
+1. Prepare a dedicated Linux host with hugepages and the target PCI devices.
+2. Install and start the GitHub self-hosted runner on that host.
+3. Add the runner labels `linux` and `bypass-hardware`.
+4. Run the local readiness script directly on the host:
+
+```bash
+bash tools/hardware/validate_host.sh \
+  --spdk-pci 0000:01:00.0 \
+  --dpdk-pci 0000:02:00.0 \
+  --require-hugepages \
+  --check-spdk \
+  --check-dpdk
+```
+
+5. Trigger the `Hardware Validation` workflow from GitHub Actions with the same
+   PCI BDF values.
+
+For the current repository state, a passing hardware workflow means the host is
+ready, the Rust feature surface builds, and the selected PCI devices are visible
+with the expected driver setup. It does not yet mean that native SPDK NVMe
+commands or DPDK RX/TX bursts were executed.
 
 ## Boundary
 
-This phase validates host readiness and Rust feature gates. True hardware I/O
-still requires a later native-runtime phase where `SpdkBackend::native_status()`
-or `DpdkBackend::native_status()` reports `linked = true`, native link checks
-pass on the target host, native symbols are actually called, and
-device-specific I/O tests are executed against bound hardware.
+This workflow validates host readiness and Rust feature gates. True hardware I/O
+still requires native-runtime work where `SpdkBackend::native_status()` or
+`DpdkBackend::native_status()` reports `linked = true`, native link checks pass
+on the target host, native symbols are actually called, and device-specific I/O
+tests are executed against bound hardware.
 
 See `docs/native-linking.md` for the opt-in native link-check environment
 variables, and `docs/native-runtime-adapters.md` for the unsafe adapter boundary

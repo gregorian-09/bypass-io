@@ -28,6 +28,7 @@ The default workflow:
 - Installs Meson, Ninja, compiler, NUMA, pkg-config, and Python ELF tooling.
 - Runs `meson setup build`.
 - Runs `ninja -C build`.
+- Installs the freshly built DPDK tree into the disposable runner.
 - Runs `cargo test --features dpdk`.
 - Runs `cargo test --all-features`.
 - Runs an opt-in native DPDK link check using DPDK's generated pkg-config
@@ -54,7 +55,7 @@ To run DPDK against a real NIC, the machine also needs hugepages and a NIC bound
 to VFIO or UIO. That is a host-level networking setup step, not a normal Rust
 development prerequisite.
 
-For this crate's Rust-side Phase 3 checks, local DPDK is not required:
+For this crate's Rust-side feature checks, local DPDK is not required:
 
 ```bash
 cargo test --features dpdk

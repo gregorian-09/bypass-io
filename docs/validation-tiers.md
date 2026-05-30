@@ -4,8 +4,6 @@
 while native SPDK/DPDK validation remains available when the right environment
 exists.
 
-For a high-level implementation map, see `docs/project-status.md`.
-
 ## Tier 0 - Local Rust Checks
 
 Run before committing normal Rust changes:
@@ -35,8 +33,7 @@ Workflow:
 
 This runs on pull requests and pushes to `main` or `feature/**` branches. It
 checks formatting, the workspace test matrix, clippy, rustdoc, a small
-`bypass-cli bench db` smoke run, `bypass-cli doctor native`, and verifies
-`.internal` files are not tracked.
+`bypass-cli bench db` smoke run, and `bypass-cli doctor native`.
 
 ## Tier 2 - Native Build CI
 

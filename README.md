@@ -77,7 +77,6 @@ the native runtime adapters are completed and hardware-tested.
 
 ## Documentation
 
-- `docs/project-status.md`: implementation status and remaining work.
 - `docs/validation-tiers.md`: local, CI, native, hardware, and performance
   validation tiers.
 - `docs/native-runtime-adapters.md`: unsafe native adapter boundary and safety
@@ -93,8 +92,3 @@ the native runtime adapters are completed and hardware-tested.
   against a temporary file.
 - `bypass-db/examples/table_lifecycle.rs`: schema creation, append, flush,
   mmap-backed scan, compaction, and cleanup.
-
-## Internal Ledger
-
-`.internal/` contains local-only project notes, specifications, and the learning
-ledger. It is intentionally ignored by Git and should not be pushed.

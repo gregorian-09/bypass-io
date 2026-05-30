@@ -53,7 +53,7 @@ To run SPDK against real NVMe hardware, the machine also needs hugepages and a
 device bound to VFIO or UIO. That is a machine-level setup step, not a normal
 Rust development prerequisite.
 
-For this crate's Rust-side Phase 2 checks, local SPDK is not required:
+For this crate's Rust-side feature checks, local SPDK is not required:
 
 ```bash
 cargo test --features spdk

@@ -87,6 +87,3 @@ jobs:
           fi
 
           bash tools/hardware/validate_host.sh "${args[@]}"
-
-      - name: Verify internal ledger is not tracked
-        run: test -z "$(git ls-files .internal)"

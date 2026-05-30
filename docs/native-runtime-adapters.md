@@ -3,14 +3,11 @@
 The native runtime adapters are the boundary between safe Rust backend APIs and
 unsafe SPDK/DPDK C calls.
 
-This phase intentionally adds adapter scaffolds, not live native I/O. The
-scaffolds compile only when the build script enables `bypass_io_native_spdk` or
-`bypass_io_native_dpdk`, and every operation still returns `RuntimeUnavailable`.
-That keeps the project honest: native link flags can be validated before the
-unsafe call paths are trusted.
-
-For the overall project status and remaining implementation phases, see
-`docs/project-status.md`.
+The current implementation intentionally adds adapter scaffolds, not live native
+I/O. The scaffolds compile only when the build script enables
+`bypass_io_native_spdk` or `bypass_io_native_dpdk`, and every operation still
+returns `RuntimeUnavailable`. That keeps the project honest: native link flags
+can be validated before the unsafe call paths are trusted.
 
 ## SPDK Adapter Boundary
 

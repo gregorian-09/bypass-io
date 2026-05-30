@@ -9,8 +9,8 @@ the Rust crate can receive native link flags and that Cargo will fail early if
 the configured native libraries are missing.
 
 They do not yet enable real SPDK NVMe I/O or DPDK packet I/O. The safe runtime
-adapters still return `RuntimeUnavailable` until a later phase implements and
-hardware-tests the C call paths.
+adapters still return `RuntimeUnavailable` until the native runtime
+implementation adds and hardware-tests the C call paths.
 
 ## SPDK
 
@@ -87,9 +87,9 @@ native runtime adapter scaffold has I/O disabled. This distinction matters:
 - `linked = true`: Cargo accepted native link flags for the build.
 - `RuntimeUnavailable`: the Rust backend still does not submit real native I/O.
 
-The next native-runtime phase must replace the validation runtime with audited
-SPDK/DPDK call paths before benchmarks or applications rely on real hardware
-I/O.
+The native-runtime implementation must replace the validation runtime with
+audited SPDK/DPDK call paths before benchmarks or applications rely on real
+hardware I/O.
 
 See `docs/native-runtime-adapters.md` for the adapter scaffolds and safety
 requirements that must be satisfied before native I/O is enabled.
