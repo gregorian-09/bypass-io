@@ -107,3 +107,21 @@ cargo run --release -p bypass-cli -- bench db \
   --compact \
   --history bench-history.jsonl
 ```
+
+## Tier 5 - Release Packaging
+
+Workflow:
+
+```text
+.github/workflows/release.yml
+```
+
+This workflow runs on manual dispatch and version tags matching `v*.*.*`. It
+validates package contents with:
+
+```bash
+cargo package --workspace
+```
+
+See `docs/release.md` for the local release-validation command and the current
+publishing boundary.

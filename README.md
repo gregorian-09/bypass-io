@@ -83,6 +83,7 @@ the native runtime adapters are completed and hardware-tested.
   requirements.
 - `docs/native-linking.md`: opt-in SPDK/DPDK native link-check commands.
 - `docs/hardware-validation.md`: host readiness and self-hosted runner usage.
+- `docs/release.md`: package validation before release.
 - `docs/bypass-cli.md`: CLI commands.
 - `docs/bypass-db-storage.md`: columnar storage and scan design.
 
