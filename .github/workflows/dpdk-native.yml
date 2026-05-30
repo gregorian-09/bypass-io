@@ -83,18 +83,24 @@ jobs:
         working-directory: _dpdk
         run: ninja -C build -j"${{ inputs.build_jobs }}"
 
+      - name: Install DPDK
+        working-directory: _dpdk
+        run: |
+          sudo ninja -C build install
+          sudo ldconfig
+
       - name: Locate DPDK pkg-config metadata
         id: dpdk-pkgconfig
         shell: bash
         run: |
-          pc_file=$(find "$GITHUB_WORKSPACE/_dpdk/build" -name libdpdk.pc -print -quit)
+          pc_file=$(pkg-config --path libdpdk || true)
           if [[ -z "$pc_file" ]]; then
-            echo "libdpdk.pc was not generated under _dpdk/build" >&2
+            echo "libdpdk.pc was not installed into the runner pkg-config path" >&2
             exit 1
           fi
           pc_dir=$(dirname "$pc_file")
           echo "path=$pc_dir" >> "$GITHUB_OUTPUT"
-          PKG_CONFIG_PATH="$pc_dir" pkg-config --libs libdpdk
+          pkg-config --libs libdpdk
 
       - name: Optionally run DPDK fast tests
         if: ${{ inputs.run_dpdk_tests }}
