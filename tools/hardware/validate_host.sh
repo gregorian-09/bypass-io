@@ -37,6 +37,9 @@ require_hugepages=0
 check_spdk=0
 check_dpdk=0
 failures=0
+proc_root=${BYPASS_IO_PROC_ROOT:-/proc}
+sys_root=${BYPASS_IO_SYS_ROOT:-/sys}
+dev_root=${BYPASS_IO_DEV_ROOT:-/dev}
 
 emit() {
   local check=$1
@@ -102,10 +105,11 @@ done
 
 pass "kernel" "$(uname -srmo)"
 
-if [[ -r /proc/meminfo ]]; then
-  huge_total=$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)
-  huge_free=$(awk '/^HugePages_Free:/ {print $2}' /proc/meminfo)
-  huge_size=$(awk '/^Hugepagesize:/ {print $2 " " $3}' /proc/meminfo)
+meminfo_path="${proc_root}/meminfo"
+if [[ -r "$meminfo_path" ]]; then
+  huge_total=$(awk '/^HugePages_Total:/ {print $2}' "$meminfo_path")
+  huge_free=$(awk '/^HugePages_Free:/ {print $2}' "$meminfo_path")
+  huge_size=$(awk '/^Hugepagesize:/ {print $2 " " $3}' "$meminfo_path")
 
   huge_total=${huge_total:-0}
   huge_free=${huge_free:-0}
@@ -126,16 +130,18 @@ else
   fi
 fi
 
-if [[ -e /dev/vfio/vfio ]]; then
-  pass "vfio" "/dev/vfio/vfio is present"
+vfio_path="${dev_root}/vfio/vfio"
+if [[ -e "$vfio_path" ]]; then
+  pass "vfio" "${vfio_path} is present"
 else
-  warn "vfio" "/dev/vfio/vfio is not present; VFIO-bound device tests will not run"
+  warn "vfio" "${vfio_path} is not present; VFIO-bound device tests will not run"
 fi
 
-if [[ -d /sys/bus/pci/drivers/vfio-pci ]]; then
-  pass "vfio_pci" "vfio-pci driver is visible in sysfs"
+vfio_pci_path="${sys_root}/bus/pci/drivers/vfio-pci"
+if [[ -d "$vfio_pci_path" ]]; then
+  pass "vfio_pci" "vfio-pci driver is visible in ${sys_root}"
 else
-  warn "vfio_pci" "vfio-pci driver is not visible in sysfs"
+  warn "vfio_pci" "vfio-pci driver is not visible in ${sys_root}"
 fi
 
 check_pci_device() {
@@ -147,9 +153,9 @@ check_pci_device() {
     return
   fi
 
-  local path="/sys/bus/pci/devices/${bdf}"
+  local path="${sys_root}/bus/pci/devices/${bdf}"
   if [[ ! -e "$path" ]]; then
-    fail "$check" "PCI device ${bdf} was not found under /sys/bus/pci/devices"
+    fail "$check" "PCI device ${bdf} was not found under ${sys_root}/bus/pci/devices"
     return
   fi
 

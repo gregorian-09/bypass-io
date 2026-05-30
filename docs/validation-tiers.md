@@ -33,7 +33,8 @@ Workflow:
 
 This runs on pull requests and pushes to `main` or `feature/**` branches. It
 checks formatting, the workspace test matrix, clippy, rustdoc, a small
-`bypass-cli bench db` smoke run, and `bypass-cli doctor native`.
+`bypass-cli bench db` smoke run, `bypass-cli doctor native`, and deterministic
+hardware-readiness fixtures.
 
 ## Tier 2 - Native Build CI
 

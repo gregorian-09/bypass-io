@@ -70,7 +70,25 @@ exits non-zero.
 
 ## GitHub Actions Workflow
 
-Manual workflow:
+There are two CI paths:
+
+- Hosted CI validates the readiness script with deterministic fixtures. This
+  catches regressions in hugepage, VFIO, and PCI-device detection logic without
+  needing real hardware.
+- The manual hardware workflow validates a real host through a self-hosted
+  runner.
+
+Hosted fixture test:
+
+```text
+tools/hardware/test_validate_host.sh
+```
+
+The fixture test is run by the normal Rust CI workflow on GitHub-hosted Linux.
+It simulates readable `/proc`, `/sys`, and `/dev` roots and verifies both
+passing and failing readiness cases.
+
+Manual workflow for a real hardware host:
 
 ```text
 .github/workflows/hardware-validation.yml

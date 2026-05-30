@@ -77,3 +77,6 @@ jobs:
 
       - name: Smoke test native readiness reporting
         run: cargo run -p bypass-cli -- doctor native
+
+      - name: Test hardware readiness fixtures
+        run: bash tools/hardware/test_validate_host.sh
