@@ -30,6 +30,8 @@ The default workflow:
 - Runs `ninja -C build`.
 - Runs `cargo test --features dpdk`.
 - Runs `cargo test --all-features`.
+- Runs an opt-in native DPDK link check using DPDK's generated pkg-config
+  metadata.
 - Runs `cargo clippy --all-targets --all-features -- -D warnings`.
 
 DPDK's fast tests are optional because they add time and may depend on runner

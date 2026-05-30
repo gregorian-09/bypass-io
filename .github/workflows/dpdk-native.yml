@@ -16,6 +16,11 @@ on:
         required: true
         type: boolean
         default: false
+      run_native_link_check:
+        description: "Run bypass-io native DPDK link check after building DPDK"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -78,6 +83,19 @@ jobs:
         working-directory: _dpdk
         run: ninja -C build -j"${{ inputs.build_jobs }}"
 
+      - name: Locate DPDK pkg-config metadata
+        id: dpdk-pkgconfig
+        shell: bash
+        run: |
+          pc_file=$(find "$GITHUB_WORKSPACE/_dpdk/build" -name libdpdk.pc -print -quit)
+          if [[ -z "$pc_file" ]]; then
+            echo "libdpdk.pc was not generated under _dpdk/build" >&2
+            exit 1
+          fi
+          pc_dir=$(dirname "$pc_file")
+          echo "path=$pc_dir" >> "$GITHUB_OUTPUT"
+          PKG_CONFIG_PATH="$pc_dir" pkg-config --libs libdpdk
+
       - name: Optionally run DPDK fast tests
         if: ${{ inputs.run_dpdk_tests }}
         working-directory: _dpdk
@@ -88,6 +106,13 @@ jobs:
 
       - name: Validate all Rust features
         run: cargo test --all-features
+
+      - name: Validate native DPDK link flags
+        if: ${{ inputs.run_native_link_check }}
+        env:
+          BYPASS_IO_NATIVE_DPDK: "1"
+          PKG_CONFIG_PATH: ${{ steps.dpdk-pkgconfig.outputs.path }}
+        run: cargo test -p bypass-io --features dpdk
 
       - name: Lint all Rust features
         run: cargo clippy --all-targets --all-features -- -D warnings

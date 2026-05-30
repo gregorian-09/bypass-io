@@ -30,6 +30,8 @@ The default workflow:
 - Runs `make`.
 - Runs `cargo test --features spdk`.
 - Runs `cargo test --all-features`.
+- Runs an opt-in native SPDK link check using SPDK's generated pkg-config
+  metadata.
 - Runs `cargo clippy --all-targets --all-features -- -D warnings`.
 
 SPDK's own unit tests are optional because they add more time and log volume.
@@ -64,7 +66,8 @@ opt-in build-script path:
 
 ```bash
 BYPASS_IO_NATIVE_SPDK=1 \
-SPDK_LIB_DIR=/path/to/spdk/build/lib \
+SPDK_USE_PKG_CONFIG=1 \
+PKG_CONFIG_PATH=/path/to/spdk/build/lib/pkgconfig \
 cargo test -p bypass-io --features spdk
 ```
 

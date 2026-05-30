@@ -23,6 +23,18 @@ SPDK_LIB_DIR=/opt/spdk/build/lib \
 cargo test -p bypass-io --features spdk
 ```
 
+Prefer SPDK's generated pkg-config metadata when it is available:
+
+```bash
+BYPASS_IO_NATIVE_SPDK=1 \
+SPDK_USE_PKG_CONFIG=1 \
+PKG_CONFIG_PATH=/opt/spdk/build/lib/pkgconfig \
+cargo test -p bypass-io --features spdk
+```
+
+`SPDK_PKG_CONFIG_PATH` can be used instead of `PKG_CONFIG_PATH` when you want
+the override to apply only to the `bypass-io` SPDK build script.
+
 By default, the build script links these SPDK libraries as static libraries:
 
 ```text

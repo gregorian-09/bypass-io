@@ -6,6 +6,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(bypass_io_native_spdk)");
     println!("cargo:rustc-check-cfg=cfg(bypass_io_native_dpdk)");
     println!("cargo:rerun-if-env-changed=BYPASS_IO_NATIVE_SPDK");
+    println!("cargo:rerun-if-env-changed=SPDK_USE_PKG_CONFIG");
+    println!("cargo:rerun-if-env-changed=SPDK_PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=SPDK_PKG_CONFIG_LIBS");
     println!("cargo:rerun-if-env-changed=SPDK_LIB_DIR");
     println!("cargo:rerun-if-env-changed=SPDK_LIBS");
     println!("cargo:rerun-if-env-changed=SPDK_SYSTEM_LIBS");
@@ -60,6 +63,11 @@ fn split_csv_env(name: &str, default: &[&str]) -> Vec<String> {
 }
 
 fn link_spdk() {
+    if env_enabled("SPDK_USE_PKG_CONFIG") {
+        link_spdk_with_pkg_config();
+        return;
+    }
+
     let spdk_lib_dir = required_env("SPDK_LIB_DIR");
     let link_kind = env::var("SPDK_LINK_KIND").unwrap_or_else(|_| "static".to_owned());
     let spdk_libs = split_csv_env("SPDK_LIBS", &["spdk_nvme", "spdk_env_dpdk", "spdk_util"]);
@@ -75,34 +83,53 @@ fn link_spdk() {
     println!("cargo:rustc-cfg=bypass_io_native_spdk");
 }
 
+fn link_spdk_with_pkg_config() {
+    let packages = split_csv_env("SPDK_PKG_CONFIG_LIBS", &["spdk_nvme", "spdk_env_dpdk"]);
+    emit_pkg_config_libs(&packages, false);
+    emit_pkg_config_libs(&["spdk_syslibs".to_owned()], true);
+    println!("cargo:rustc-cfg=bypass_io_native_spdk");
+}
+
 fn link_dpdk() {
-    let pkg_config = env::var_os("PKG_CONFIG").unwrap_or_else(|| OsString::from("pkg-config"));
     let package = env::var("DPDK_PKG_CONFIG_NAME").unwrap_or_else(|_| "libdpdk".to_owned());
-    let output = Command::new(&pkg_config)
-        .arg("--libs")
-        .arg(&package)
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to execute {} for {package}: {error}",
-                pkg_config.to_string_lossy()
-            )
-        });
+    emit_pkg_config_libs(&[package], false);
+    println!("cargo:rustc-cfg=bypass_io_native_dpdk");
+}
+
+fn emit_pkg_config_libs(packages: &[String], include_static: bool) {
+    let pkg_config = env::var_os("PKG_CONFIG").unwrap_or_else(|| OsString::from("pkg-config"));
+    let mut command = Command::new(&pkg_config);
+    command.arg("--libs");
+    if include_static {
+        command.arg("--static");
+    }
+    command.args(packages);
+    if let Ok(path) = env::var("SPDK_PKG_CONFIG_PATH") {
+        command.env("PKG_CONFIG_PATH", path);
+    }
+    let output = command.output().unwrap_or_else(|error| {
+        panic!(
+            "failed to execute {} for {:?}: {error}",
+            pkg_config.to_string_lossy(),
+            packages
+        )
+    });
 
     if !output.status.success() {
         panic!(
-            "{} --libs {package} failed: {}",
+            "{} --libs {:?} failed: {}",
             pkg_config.to_string_lossy(),
+            packages,
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    let libs = String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| panic!("pkg-config output for {package} was not UTF-8: {error}"));
+    let libs = String::from_utf8(output.stdout).unwrap_or_else(|error| {
+        panic!("pkg-config output for {packages:?} was not UTF-8: {error}")
+    });
     for token in libs.split_whitespace() {
         emit_pkg_config_link_token(token);
     }
-    println!("cargo:rustc-cfg=bypass_io_native_dpdk");
 }
 
 fn emit_pkg_config_link_token(token: &str) {
