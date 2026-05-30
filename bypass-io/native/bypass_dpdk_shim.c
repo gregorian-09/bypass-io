@@ -1,3 +1,4 @@
+#include <sys/types.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -42,10 +43,7 @@ int bypass_dpdk_configure_port(
     }
 
     if (promiscuous) {
-        rc = rte_eth_promiscuous_enable(port_id);
-        if (rc < 0) {
-            return rc;
-        }
+        rte_eth_promiscuous_enable(port_id);
     }
 
     return 0;

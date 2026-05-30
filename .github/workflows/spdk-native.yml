@@ -104,7 +104,9 @@ jobs:
           SPDK_USE_PKG_CONFIG: "1"
           SPDK_PKG_CONFIG_PATH: ${{ github.workspace }}/_spdk/build/lib/pkgconfig
           PKG_CONFIG_PATH: ${{ github.workspace }}/_spdk/build/lib/pkgconfig
-        run: cargo test -p bypass-io --features spdk
+        run: |
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/_spdk/build/lib:${GITHUB_WORKSPACE}/_spdk/dpdk/build/lib:${GITHUB_WORKSPACE}/_spdk/dpdk/build/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+          cargo test -p bypass-io --features spdk
 
       - name: Lint all Rust features
         run: cargo clippy --all-targets --all-features -- -D warnings
