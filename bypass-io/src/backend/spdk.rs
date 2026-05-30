@@ -222,8 +222,8 @@ impl IoBackend for SpdkBackend {
         Box::pin(async move {
             let len = total_pooled_len(bufs.iter())?;
             let (namespace, qpair, range) = self.prepare_io(target, len, offset)?;
-            let segments = spdk_segments(bufs.iter())?;
-            self.runtime.readv(namespace, qpair, &segments, range)
+            let mut segments = spdk_segments(bufs.iter())?;
+            self.runtime.readv(namespace, qpair, &mut segments, range)
         })
     }
 
@@ -583,6 +583,20 @@ impl SpdkBufferSegment {
             len: huge.len(),
         })
     }
+
+    #[cfg(test)]
+    fn as_slice(&self) -> &[u8] {
+        // Safety: `from_pooled` constructs segments only from a live `PooledBuf`
+        // borrow. Test runtimes call this before the backend future resolves.
+        unsafe { std::slice::from_raw_parts(self._addr as *const u8, self.len) }
+    }
+
+    #[cfg(test)]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // Safety: read paths create the segment from `&mut PooledBuf`, and the
+        // test runtime completes synchronously before the borrow is released.
+        unsafe { std::slice::from_raw_parts_mut(self._addr as *mut u8, self.len) }
+    }
 }
 
 trait SpdkRuntime: Send + Sync + 'static {
@@ -606,7 +620,7 @@ trait SpdkRuntime: Send + Sync + 'static {
         &self,
         namespace: &NvmeNamespace,
         qpair: &IoQueuePair,
-        segments: &[SpdkBufferSegment],
+        segments: &mut [SpdkBufferSegment],
         range: NvmeLbaRange,
     ) -> Result<usize, SpdkError>;
 
@@ -650,7 +664,7 @@ impl SpdkRuntime for UnavailableSpdkRuntime {
         &self,
         _namespace: &NvmeNamespace,
         _qpair: &IoQueuePair,
-        _segments: &[SpdkBufferSegment],
+        _segments: &mut [SpdkBufferSegment],
         _range: NvmeLbaRange,
     ) -> Result<usize, SpdkError> {
         Err(runtime_unavailable())
@@ -777,7 +791,7 @@ mod native {
             &self,
             namespace: &NvmeNamespace,
             qpair: &IoQueuePair,
-            segments: &[SpdkBufferSegment],
+            segments: &mut [SpdkBufferSegment],
             range: super::NvmeLbaRange,
         ) -> Result<usize, SpdkError> {
             self.fallback.readv(namespace, qpair, segments, range)
@@ -816,8 +830,12 @@ mod native {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{remove_file, File, OpenOptions};
+    use std::os::unix::fs::FileExt;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         IoQueuePair, NvmeController, NvmeLbaRange, NvmeNamespace, SpdkBackend, SpdkBufferSegment,
@@ -862,7 +880,7 @@ mod tests {
             &self,
             _namespace: &NvmeNamespace,
             _qpair: &IoQueuePair,
-            segments: &[SpdkBufferSegment],
+            segments: &mut [SpdkBufferSegment],
             _range: NvmeLbaRange,
         ) -> Result<usize, SpdkError> {
             super::total_len(segments)
@@ -890,8 +908,147 @@ mod tests {
         }
     }
 
+    struct FileBackedSpdkRuntime {
+        file: Mutex<File>,
+        flushes: AtomicUsize,
+    }
+
+    impl FileBackedSpdkRuntime {
+        fn new(file: File) -> Self {
+            Self {
+                file: Mutex::new(file),
+                flushes: AtomicUsize::new(0),
+            }
+        }
+
+        fn range_offset(namespace: &NvmeNamespace, range: NvmeLbaRange) -> Result<u64, SpdkError> {
+            range
+                .lba
+                .checked_mul(namespace.sector_size() as u64)
+                .ok_or(SpdkError::SubmitFailed { rc: -1 })
+        }
+
+        fn range_len(namespace: &NvmeNamespace, range: NvmeLbaRange) -> Result<usize, SpdkError> {
+            let bytes = range
+                .lba_count
+                .checked_mul(namespace.sector_size() as u64)
+                .ok_or(SpdkError::LengthOverflow)?;
+            usize::try_from(bytes).map_err(|_| SpdkError::LengthOverflow)
+        }
+
+        fn io_error() -> SpdkError {
+            SpdkError::SubmitFailed { rc: -1 }
+        }
+    }
+
+    impl SpdkRuntime for FileBackedSpdkRuntime {
+        fn read(
+            &self,
+            namespace: &NvmeNamespace,
+            _qpair: &IoQueuePair,
+            mut segment: SpdkBufferSegment,
+            range: NvmeLbaRange,
+        ) -> Result<usize, SpdkError> {
+            let offset = Self::range_offset(namespace, range)?;
+            let len = Self::range_len(namespace, range)?;
+            let slice = segment
+                .as_mut_slice()
+                .get_mut(..len)
+                .ok_or(SpdkError::LengthOverflow)?;
+            let file = self.file.lock().unwrap();
+            file.read_exact_at(slice, offset)
+                .map_err(|_| Self::io_error())?;
+            Ok(len)
+        }
+
+        fn write(
+            &self,
+            namespace: &NvmeNamespace,
+            _qpair: &IoQueuePair,
+            segment: SpdkBufferSegment,
+            range: NvmeLbaRange,
+        ) -> Result<usize, SpdkError> {
+            let offset = Self::range_offset(namespace, range)?;
+            let len = Self::range_len(namespace, range)?;
+            let slice = segment
+                .as_slice()
+                .get(..len)
+                .ok_or(SpdkError::LengthOverflow)?;
+            let file = self.file.lock().unwrap();
+            file.write_all_at(slice, offset)
+                .map_err(|_| Self::io_error())?;
+            Ok(len)
+        }
+
+        fn readv(
+            &self,
+            namespace: &NvmeNamespace,
+            _qpair: &IoQueuePair,
+            segments: &mut [SpdkBufferSegment],
+            range: NvmeLbaRange,
+        ) -> Result<usize, SpdkError> {
+            let mut offset = Self::range_offset(namespace, range)?;
+            let mut total = 0usize;
+            let file = self.file.lock().unwrap();
+            for segment in segments {
+                let slice = segment.as_mut_slice();
+                file.read_exact_at(slice, offset)
+                    .map_err(|_| Self::io_error())?;
+                offset = offset
+                    .checked_add(slice.len() as u64)
+                    .ok_or(SpdkError::LengthOverflow)?;
+                total = total
+                    .checked_add(slice.len())
+                    .ok_or(SpdkError::LengthOverflow)?;
+            }
+            Ok(total)
+        }
+
+        fn writev(
+            &self,
+            namespace: &NvmeNamespace,
+            _qpair: &IoQueuePair,
+            segments: &[SpdkBufferSegment],
+            range: NvmeLbaRange,
+        ) -> Result<usize, SpdkError> {
+            let mut offset = Self::range_offset(namespace, range)?;
+            let mut total = 0usize;
+            let file = self.file.lock().unwrap();
+            for segment in segments {
+                let slice = segment.as_slice();
+                file.write_all_at(slice, offset)
+                    .map_err(|_| Self::io_error())?;
+                offset = offset
+                    .checked_add(slice.len() as u64)
+                    .ok_or(SpdkError::LengthOverflow)?;
+                total = total
+                    .checked_add(slice.len())
+                    .ok_or(SpdkError::LengthOverflow)?;
+            }
+            Ok(total)
+        }
+
+        fn flush(&self, _namespace: &NvmeNamespace, _qpair: &IoQueuePair) -> Result<(), SpdkError> {
+            self.file
+                .lock()
+                .unwrap()
+                .sync_all()
+                .map_err(|_| Self::io_error())?;
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn process_completions(&self, _qpair: &IoQueuePair, _max_completions: u32) -> usize {
+            0
+        }
+    }
+
     fn namespace() -> NvmeNamespace {
         NvmeNamespace::new(1, 512, 4096, 4096).unwrap()
+    }
+
+    fn file_backed_namespace() -> NvmeNamespace {
+        NvmeNamespace::new(1, 512, 8192, 2 * 1024 * 1024).unwrap()
     }
 
     fn backend(runtime: Arc<dyn SpdkRuntime>) -> SpdkBackend {
@@ -901,6 +1058,35 @@ mod tests {
             vec![IoQueuePair::new(0), IoQueuePair::new(1)],
             runtime,
         )
+    }
+
+    fn backend_with_namespace(
+        namespace: NvmeNamespace,
+        runtime: Arc<dyn SpdkRuntime>,
+    ) -> SpdkBackend {
+        SpdkBackend::with_runtime(
+            NvmeController::new("test", Some("0000:01:00.0".to_string())),
+            vec![namespace],
+            vec![IoQueuePair::new(0)],
+            runtime,
+        )
+    }
+
+    fn temp_file(prefix: &str, len: u64) -> (File, PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("bypass-io-{prefix}-{}-{stamp}", std::process::id()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(len).unwrap();
+        (file, path)
     }
 
     #[test]
@@ -982,6 +1168,49 @@ mod tests {
             runtime.polls.load(Ordering::Relaxed),
             super::COMPLETIONS_PER_POLL as usize * 2
         );
+    }
+
+    #[test]
+    fn file_backed_runtime_moves_bytes_through_spdk_backend_pipeline() {
+        let (file, path) = temp_file("spdk", 4 * 1024 * 1024);
+        let runtime = Arc::new(FileBackedSpdkRuntime::new(file));
+        let backend = backend_with_namespace(
+            file_backed_namespace(),
+            Arc::clone(&runtime) as Arc<dyn SpdkRuntime>,
+        );
+        let pool = BufPool::new(2, 512, HugePageSize::Mib2).unwrap();
+        let mut write_buf = pool.acquire().unwrap();
+        let mut read_buf = pool.acquire().unwrap();
+
+        let write_len = write_buf.len();
+        {
+            // Safety: the test owns both checked-out buffers and no runtime has
+            // a pending operation touching them while the slices are live.
+            let write_slice = unsafe { write_buf.buf_mut().as_slice_mut() };
+            let read_slice = unsafe { read_buf.buf_mut().as_slice_mut() };
+            for (idx, byte) in write_slice.iter_mut().enumerate() {
+                *byte = (idx % 251) as u8;
+            }
+            read_slice.fill(0);
+        }
+
+        let target = DeviceTarget::NvmeNs { nsid: 1 };
+        match block_on(backend.write(target.clone(), &write_buf, 512)) {
+            Ok(written) => assert_eq!(written, write_len),
+            Err(SpdkError::DmaBufferUnavailable { .. }) => {
+                remove_file(path).ok();
+                return;
+            }
+            Err(err) => panic!("unexpected SPDK write error: {err:?}"),
+        }
+
+        let read = block_on(backend.read(target.clone(), &mut read_buf, 512)).unwrap();
+        assert_eq!(read, write_len);
+        block_on(backend.flush(target)).unwrap();
+        assert_eq!(runtime.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(read_buf.buf().as_slice(), write_buf.buf().as_slice());
+
+        remove_file(path).ok();
     }
 
     #[test]

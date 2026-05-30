@@ -91,3 +91,28 @@ three states:
   functions and passes hardware tests.
 
 Only the first two states exist today.
+
+## File-Backed Runtime Tests
+
+The unit tests include file-backed SPDK and DPDK runtime implementations. These
+are not public backends and do not link native libraries. They exist to prove
+the Rust-side backend pipeline before unsafe native calls are enabled:
+
+- `PooledBuf` checkout and byte access
+- backend target validation
+- SPDK buffer-segment construction and DMA eligibility checks
+- SPDK byte offset to LBA conversion
+- runtime read/write delegation through the same `IoBackend` futures used by
+  callers
+- DPDK runtime read/write delegation through the network-port target path
+
+The SPDK file-backed test uses a temporary file as a namespace image and issues
+`pread`/`pwrite` at the byte offset derived from the validated LBA range. On
+hosts where Linux does not expose a page-locked, physical-address-visible buffer
+to the process, the test accepts the expected DMA eligibility rejection instead
+of pretending the buffer could be submitted to SPDK.
+
+The DPDK file-backed test uses a temporary file as a deterministic packet data
+source/sink. DPDK has no byte-offset target in the shared `IoBackend` contract,
+so the test validates buffer movement through the port and queue runtime seam
+rather than storage-style LBA translation.

@@ -1043,9 +1043,13 @@ mod native {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{remove_file, File, OpenOptions};
     use std::net::Ipv4Addr;
+    use std::os::unix::fs::FileExt;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         DpdkBackend, DpdkConfig, DpdkError, DpdkPortConfig, DpdkRuntime, EtherType, MulticastGroup,
@@ -1135,6 +1139,159 @@ mod tests {
         }
     }
 
+    struct FileBackedDpdkRuntime {
+        file: Mutex<File>,
+        polls: AtomicUsize,
+    }
+
+    impl FileBackedDpdkRuntime {
+        fn new(file: File) -> Self {
+            Self {
+                file: Mutex::new(file),
+                polls: AtomicUsize::new(0),
+            }
+        }
+
+        fn operation_failed(operation: &'static str) -> DpdkError {
+            DpdkError::OperationFailed { operation, rc: -1 }
+        }
+    }
+
+    impl DpdkRuntime for FileBackedDpdkRuntime {
+        fn init(&self, _config: &DpdkConfig) -> Result<(), DpdkError> {
+            Ok(())
+        }
+
+        fn rx_burst(
+            &self,
+            _port_id: u16,
+            _queue: QueueId,
+            max_packets: u16,
+        ) -> Result<Vec<Packet>, DpdkError> {
+            let mut data = vec![0u8; 64];
+            self.file
+                .lock()
+                .unwrap()
+                .read_exact_at(&mut data, 0)
+                .map_err(|_| Self::operation_failed("file-backed rx_burst"))?;
+            Ok((0..max_packets)
+                .map(|_| Packet::from_bytes(data.clone()))
+                .collect())
+        }
+
+        fn tx_burst(
+            &self,
+            _port_id: u16,
+            _queue: QueueId,
+            packets: &[Packet],
+        ) -> Result<u16, DpdkError> {
+            let file = self.file.lock().unwrap();
+            let mut offset = 0u64;
+            for packet in packets {
+                file.write_all_at(packet.bytes(), offset)
+                    .map_err(|_| Self::operation_failed("file-backed tx_burst"))?;
+                offset = offset
+                    .checked_add(packet.bytes().len() as u64)
+                    .ok_or_else(|| Self::operation_failed("file-backed tx_burst"))?;
+            }
+            Ok(packets.len() as u16)
+        }
+
+        fn join_multicast(
+            &self,
+            _port_id: u16,
+            _group: MulticastGroup,
+            _queue: QueueId,
+        ) -> Result<(), DpdkError> {
+            Ok(())
+        }
+
+        fn read_packet(
+            &self,
+            _port_id: u16,
+            _queue: QueueId,
+            buf: &mut PooledBuf,
+        ) -> Result<usize, DpdkError> {
+            let len = buf.len();
+            // Safety: DPDK read receives `&mut PooledBuf`, so this synchronous
+            // test runtime has exclusive access to the buffer while filling it.
+            let slice = unsafe { buf.buf_mut().as_slice_mut() };
+            self.file
+                .lock()
+                .unwrap()
+                .read_exact_at(slice, 0)
+                .map_err(|_| Self::operation_failed("file-backed read_packet"))?;
+            Ok(len)
+        }
+
+        fn write_packet(
+            &self,
+            _port_id: u16,
+            _queue: QueueId,
+            buf: &PooledBuf,
+        ) -> Result<usize, DpdkError> {
+            self.file
+                .lock()
+                .unwrap()
+                .write_all_at(buf.buf().as_slice(), 0)
+                .map_err(|_| Self::operation_failed("file-backed write_packet"))?;
+            Ok(buf.len())
+        }
+
+        fn read_packets(
+            &self,
+            _port_id: u16,
+            _queue: QueueId,
+            bufs: &mut [PooledBuf],
+        ) -> Result<usize, DpdkError> {
+            let file = self.file.lock().unwrap();
+            let mut offset = 0u64;
+            let mut total = 0usize;
+            for buf in bufs {
+                let len = buf.len();
+                // Safety: the runtime has exclusive access to each mutable
+                // pooled buffer for the duration of this synchronous read.
+                let slice = unsafe { buf.buf_mut().as_slice_mut() };
+                file.read_exact_at(slice, offset)
+                    .map_err(|_| Self::operation_failed("file-backed read_packets"))?;
+                offset = offset
+                    .checked_add(len as u64)
+                    .ok_or_else(|| Self::operation_failed("file-backed read_packets"))?;
+                total = total
+                    .checked_add(len)
+                    .ok_or_else(|| Self::operation_failed("file-backed read_packets"))?;
+            }
+            Ok(total)
+        }
+
+        fn write_packets(
+            &self,
+            _port_id: u16,
+            _queue: QueueId,
+            bufs: &[PooledBuf],
+        ) -> Result<usize, DpdkError> {
+            let file = self.file.lock().unwrap();
+            let mut offset = 0u64;
+            let mut total = 0usize;
+            for buf in bufs {
+                file.write_all_at(buf.buf().as_slice(), offset)
+                    .map_err(|_| Self::operation_failed("file-backed write_packets"))?;
+                offset = offset
+                    .checked_add(buf.len() as u64)
+                    .ok_or_else(|| Self::operation_failed("file-backed write_packets"))?;
+                total = total
+                    .checked_add(buf.len())
+                    .ok_or_else(|| Self::operation_failed("file-backed write_packets"))?;
+            }
+            Ok(total)
+        }
+
+        fn poll_port(&self, _port_id: u16) -> usize {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+    }
+
     fn config() -> DpdkConfig {
         DpdkConfig::new(
             vec!["bypass-io".to_string(), "-l".to_string(), "0-1".to_string()],
@@ -1149,6 +1306,23 @@ mod tests {
 
     fn backend(runtime: Arc<dyn DpdkRuntime>) -> DpdkBackend {
         DpdkBackend::with_runtime(config(), runtime)
+    }
+
+    fn temp_file(prefix: &str, len: u64) -> (File, PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("bypass-io-{prefix}-{}-{stamp}", std::process::id()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(len).unwrap();
+        (file, path)
     }
 
     #[test]
@@ -1274,6 +1448,39 @@ mod tests {
 
         assert_eq!(backend.poll_completions(), 4);
         assert_eq!(runtime.polls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn file_backed_runtime_moves_bytes_through_dpdk_backend_pipeline() {
+        let (file, path) = temp_file("dpdk", 2 * 1024 * 1024);
+        let runtime = Arc::new(FileBackedDpdkRuntime::new(file));
+        let backend = backend(Arc::clone(&runtime) as Arc<dyn DpdkRuntime>);
+        let pool = BufPool::new(2, 64, HugePageSize::Mib2).unwrap();
+        let mut write_buf = pool.acquire().unwrap();
+        let mut read_buf = pool.acquire().unwrap();
+
+        let write_len = write_buf.len();
+        {
+            // Safety: the test owns both checked-out buffers and no runtime has
+            // a pending operation touching them while the slices are live.
+            let write_slice = unsafe { write_buf.buf_mut().as_slice_mut() };
+            let read_slice = unsafe { read_buf.buf_mut().as_slice_mut() };
+            for (idx, byte) in write_slice.iter_mut().enumerate() {
+                *byte = ((idx + 17) % 251) as u8;
+            }
+            read_slice.fill(0);
+        }
+
+        let target = DeviceTarget::NetPort(2);
+        let written = block_on(backend.write(target.clone(), &write_buf, 0)).unwrap();
+        assert_eq!(written, write_len);
+        let read = block_on(backend.read(target, &mut read_buf, 0)).unwrap();
+        assert_eq!(read, write_len);
+        assert_eq!(read_buf.buf().as_slice(), write_buf.buf().as_slice());
+        assert_eq!(backend.poll_completions(), 1);
+        assert_eq!(runtime.polls.load(Ordering::Relaxed), 1);
+
+        remove_file(path).ok();
     }
 
     #[test]

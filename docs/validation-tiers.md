@@ -17,6 +17,10 @@ cargo doc --workspace --no-deps --all-features
 
 This tier does not build native SPDK or DPDK.
 
+SPDK and DPDK unit tests also include file-backed runtime adapters. These tests
+exercise the safe Rust backend pipeline and temporary-file byte movement without
+native libraries or hardware. They do not replace Tier 3 hardware validation.
+
 For native readiness inspection without mutating host state:
 
 ```bash
