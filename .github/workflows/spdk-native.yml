@@ -40,10 +40,10 @@ jobs:
 
     steps:
       - name: Checkout bypass-io
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Checkout SPDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: spdk/spdk
           ref: ${{ inputs.spdk_ref }}
@@ -55,7 +55,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry and build output
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
