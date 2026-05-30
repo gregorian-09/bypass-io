@@ -73,7 +73,15 @@ BYPASS_IO_NATIVE_DPDK=1 \
 ```
 
 Even when native link checks pass, real SPDK/DPDK I/O remains disabled until
-the native runtime adapters are completed and hardware-tested.
+hardware I/O is explicitly enabled on a prepared host:
+
+```bash
+BYPASS_IO_ENABLE_SPDK_HARDWARE=1
+BYPASS_IO_ENABLE_DPDK_HARDWARE=1
+```
+
+Only set these on dedicated machines with hugepages and safe VFIO-bound test
+devices.
 
 ## Documentation
 

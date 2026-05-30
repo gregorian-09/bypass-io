@@ -4,7 +4,7 @@
 //! with a low-latency I/O backend. [`BufPool`] keeps a fixed set of buffers
 //! available so hot paths can reuse memory rather than allocate per operation.
 
-mod hugepage;
+pub(crate) mod hugepage;
 mod iovec;
 mod pool;
 

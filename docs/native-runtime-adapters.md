@@ -3,11 +3,18 @@
 The native runtime adapters are the boundary between safe Rust backend APIs and
 unsafe SPDK/DPDK C calls.
 
-The current implementation intentionally adds adapter scaffolds, not live native
-I/O. The scaffolds compile only when the build script enables
-`bypass_io_native_spdk` or `bypass_io_native_dpdk`, and every operation still
-returns `RuntimeUnavailable`. That keeps the project honest: native link flags
-can be validated before the unsafe call paths are trusted.
+The current implementation includes hardware-gated native adapter call paths.
+They compile only when the build script enables `bypass_io_native_spdk` or
+`bypass_io_native_dpdk`. They remain disabled by default at runtime and return
+`RuntimeUnavailable` until the operator explicitly enables hardware I/O with:
+
+```bash
+export BYPASS_IO_ENABLE_SPDK_HARDWARE=1
+export BYPASS_IO_ENABLE_DPDK_HARDWARE=1
+```
+
+This keeps ordinary native link checks non-mutating while still providing the
+real adapter boundary for dedicated hardware hosts.
 
 ## SPDK Adapter Boundary
 
@@ -31,8 +38,27 @@ The adapter reserves the following native symbols for the eventual NVMe path:
 - `spdk_nvme_ns_cmd_write`
 - `spdk_nvme_ns_cmd_flush`
 - `spdk_nvme_qpair_process_completions`
+- `spdk_zmalloc`
+- `spdk_free`
 
-Before those calls are enabled, the implementation must prove:
+The adapter now uses a small C shim for SPDK environment setup and completion
+status helpers:
+
+```text
+bypass-io/native/bypass_spdk_shim.c
+```
+
+When `BYPASS_IO_ENABLE_SPDK_HARDWARE=1`, `SpdkBackend::probe_and_init()`:
+
+- initializes the SPDK environment
+- probes controllers
+- discovers active namespaces
+- allocates one I/O qpair
+- enables SPDK DMA allocation for later `BufPool` allocations
+- submits read, write, and flush commands through SPDK
+- polls the qpair synchronously until completion or timeout
+
+Before production use, the hardware validation phase must prove:
 
 - Submitted buffers remain alive until SPDK completion callbacks run.
 - DMA buffers are page-locked and acceptable to the selected SPDK environment.
@@ -67,11 +93,28 @@ The adapter reserves the following native APIs for the eventual Ethernet path:
 - `rte_eth_tx_burst`
 - `rte_flow_create`
 
+The adapter now uses a small C shim for DPDK inline/header APIs and default port
+setup:
+
+```text
+bypass-io/native/bypass_dpdk_shim.c
+```
+
+When `BYPASS_IO_ENABLE_DPDK_HARDWARE=1`, `DpdkBackend::init()`:
+
+- initializes DPDK EAL from `DpdkConfig::eal_args`
+- creates an mbuf pool
+- configures RX/TX queues with default DPDK queue configs
+- starts the configured Ethernet port
+- implements `rx_burst` and `tx_burst` through shimmed DPDK burst calls
+- copies RX mbuf bytes into safe `Packet` values and frees received mbufs
+- allocates TX mbufs, copies packet bytes into them, and frees unsent mbufs
+
 DPDK documents RX/TX burst operations as inline header APIs in common releases.
 That means the future runtime may need bindgen output or a small C shim instead
 of a direct `extern "C"` declaration for every packet fast-path operation.
 
-Before those calls are enabled, the implementation must prove:
+Before production use, the hardware validation phase must prove:
 
 - DPDK EAL is initialized once per process.
 - Mbuf ownership is explicit from RX through parsing, release, or TX.
@@ -81,16 +124,17 @@ Before those calls are enabled, the implementation must prove:
 
 ## Runtime Status
 
-`SpdkBackend::native_status()` and `DpdkBackend::native_status()` now distinguish
+`SpdkBackend::native_status()` and `DpdkBackend::native_status()` distinguish
 three states:
 
 - Default validation build: `linked = false`.
-- Native link-check build: `linked = true`, adapter scaffold compiled, I/O
-  disabled.
-- Future native runtime build: `linked = true`, adapter calls audited native
-  functions and passes hardware tests.
+- Native link-check build: `linked = true`, adapter code compiled, hardware I/O
+  disabled unless the runtime opt-in environment variable is set.
+- Hardware runtime build: `linked = true`, runtime opt-in is set, native calls
+  execute on a dedicated hardware host.
 
-Only the first two states exist today.
+The third state requires a prepared hardware machine. Hosted CI does not execute
+real native I/O.
 
 ## File-Backed Runtime Tests
 

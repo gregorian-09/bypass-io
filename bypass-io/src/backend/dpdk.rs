@@ -726,6 +726,13 @@ pub enum DpdkError {
         /// Return code.
         rc: i32,
     },
+    /// Packet bytes do not fit into the configured DPDK mbuf data room.
+    PacketTooLarge {
+        /// Requested packet length.
+        len: usize,
+        /// Configured data-room size.
+        max: usize,
+    },
 }
 
 impl fmt::Display for DpdkError {
@@ -757,6 +764,9 @@ impl fmt::Display for DpdkError {
             }
             Self::OperationFailed { operation, rc } => {
                 write!(f, "DPDK operation {operation} failed with rc={rc}")
+            }
+            Self::PacketTooLarge { len, max } => {
+                write!(f, "packet length {len} exceeds DPDK data room {max}")
             }
         }
     }
@@ -921,28 +931,36 @@ const IP_PROTO_UDP: u8 = 17;
 
 #[cfg(bypass_io_native_dpdk)]
 mod native {
+    use std::ffi::{c_char, CString};
+    use std::ptr;
+    use std::sync::Mutex;
+
     use super::{
         runtime_unavailable, DpdkConfig, DpdkError, DpdkRuntime, MulticastGroup, Packet, QueueId,
-        UnavailableDpdkRuntime,
     };
     use crate::buf::PooledBuf;
     use crate::ffi::dpdk_sys;
 
-    /// Native DPDK adapter scaffold.
-    ///
-    /// This type exists only when the build script has enabled
-    /// `bypass_io_native_dpdk`. It reserves the implementation boundary for EAL,
-    /// ethdev, mbuf, and flow-rule calls, but every method intentionally returns
-    /// [`DpdkError::RuntimeUnavailable`] until the unsafe mbuf ownership and
-    /// hardware validation plan is complete.
+    const HARDWARE_ENABLE_ENV: &str = "BYPASS_IO_ENABLE_DPDK_HARDWARE";
+
+    #[derive(Clone, Copy)]
+    struct NativeMempool(*mut dpdk_sys::rte_mempool);
+
+    // Safety: DPDK mempools are designed for cross-lcore allocation/free. Port
+    // queue use is still controlled by the caller's queue configuration.
+    unsafe impl Send for NativeMempool {}
+
+    /// Native DPDK runtime adapter.
     pub(super) struct NativeDpdkRuntime {
-        fallback: UnavailableDpdkRuntime,
+        mempool: Mutex<Option<NativeMempool>>,
+        data_room_size: Mutex<usize>,
     }
 
     impl NativeDpdkRuntime {
-        pub(super) const fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
-                fallback: UnavailableDpdkRuntime,
+                mempool: Mutex::new(None),
+                data_room_size: Mutex::new(0),
             }
         }
 
@@ -956,20 +974,134 @@ mod native {
                 "rte_eth_dev_start",
                 "rte_eth_rx_burst",
                 "rte_eth_tx_burst",
+                "rte_pktmbuf_alloc",
+                "rte_pktmbuf_free",
+                "rte_pktmbuf_append",
                 "rte_flow_create",
             ]
+        }
+
+        fn mempool(&self) -> Result<NativeMempool, DpdkError> {
+            self.mempool.lock().unwrap().ok_or_else(runtime_unavailable)
+        }
+
+        fn data_room_size(&self) -> usize {
+            *self.data_room_size.lock().unwrap()
+        }
+
+        fn packet_to_mbuf(
+            &self,
+            pool: NativeMempool,
+            packet: &[u8],
+        ) -> Result<*mut dpdk_sys::rte_mbuf, DpdkError> {
+            if packet.len() > u16::MAX as usize {
+                return Err(DpdkError::PacketTooLarge {
+                    len: packet.len(),
+                    max: u16::MAX as usize,
+                });
+            }
+            // Safety: pool is a live DPDK mempool.
+            let mbuf = unsafe { dpdk_sys::bypass_dpdk_pktmbuf_alloc(pool.0) };
+            if mbuf.is_null() {
+                return Err(DpdkError::OperationFailed {
+                    operation: "rte_pktmbuf_alloc",
+                    rc: -1,
+                });
+            }
+            // Safety: mbuf was just allocated and is uniquely owned here.
+            let dst = unsafe { dpdk_sys::bypass_dpdk_pktmbuf_append(mbuf, packet.len() as u16) };
+            if dst.is_null() {
+                // Safety: mbuf is still owned by this function.
+                unsafe {
+                    dpdk_sys::bypass_dpdk_pktmbuf_free(mbuf);
+                }
+                return Err(DpdkError::PacketTooLarge {
+                    len: packet.len(),
+                    max: self.data_room_size(),
+                });
+            }
+            // Safety: `dst` points at `packet.len()` writable bytes appended to
+            // the mbuf; source and destination do not overlap.
+            unsafe {
+                ptr::copy_nonoverlapping(packet.as_ptr(), dst.cast::<u8>(), packet.len());
+            }
+            Ok(mbuf)
         }
     }
 
     impl DpdkRuntime for NativeDpdkRuntime {
-        fn init(&self, _config: &DpdkConfig) -> Result<(), DpdkError> {
+        fn init(&self, config: &DpdkConfig) -> Result<(), DpdkError> {
+            if !hardware_enabled(HARDWARE_ENABLE_ENV) {
+                return Err(runtime_unavailable());
+            }
+
             let _apis = Self::required_apis();
-            let _ffi_markers = (
-                core::mem::size_of::<dpdk_sys::rte_mempool>(),
-                core::mem::size_of::<dpdk_sys::rte_mbuf>(),
-                core::mem::size_of::<dpdk_sys::rte_flow>(),
-            );
-            Err(runtime_unavailable())
+            let cstrings = config
+                .eal_args()
+                .iter()
+                .map(|arg| {
+                    CString::new(arg.as_str())
+                        .map_err(|_| DpdkError::InvalidConfig("EAL argument contains NUL byte"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut argv = cstrings
+                .iter()
+                .map(|arg| arg.as_ptr().cast_mut())
+                .collect::<Vec<*mut c_char>>();
+            // Safety: argv points at stable C strings for the duration of the
+            // call; DPDK owns any global EAL state it initializes.
+            let rc = unsafe { dpdk_sys::rte_eal_init(argv.len() as i32, argv.as_mut_ptr()) };
+            if rc < 0 {
+                return Err(DpdkError::OperationFailed {
+                    operation: "rte_eal_init",
+                    rc,
+                });
+            }
+
+            let pool_name = CString::new("bypass_io_mbuf_pool").unwrap();
+            // Safety: arguments follow DPDK's mempool creation contract.
+            let pool = unsafe {
+                dpdk_sys::rte_pktmbuf_pool_create(
+                    pool_name.as_ptr(),
+                    config.mbufs(),
+                    config.mbuf_cache(),
+                    0,
+                    config.data_room_size(),
+                    config.socket_id(),
+                )
+            };
+            if pool.is_null() {
+                return Err(DpdkError::OperationFailed {
+                    operation: "rte_pktmbuf_pool_create",
+                    rc: -1,
+                });
+            }
+
+            let port = config.port();
+            // Safety: pool is live; the shim uses default eth/rx/tx configs and
+            // starts the configured port.
+            let rc = unsafe {
+                dpdk_sys::bypass_dpdk_configure_port(
+                    port.port_id(),
+                    port.rx_queues(),
+                    port.tx_queues(),
+                    port.rx_desc(),
+                    port.tx_desc(),
+                    pool,
+                    config.socket_id(),
+                    i32::from(port.promiscuous()),
+                )
+            };
+            if rc < 0 {
+                return Err(DpdkError::OperationFailed {
+                    operation: "bypass_dpdk_configure_port",
+                    rc,
+                });
+            }
+
+            *self.mempool.lock().unwrap() = Some(NativeMempool(pool));
+            *self.data_room_size.lock().unwrap() = config.data_room_size() as usize;
+            Ok(())
         }
 
         fn rx_burst(
@@ -978,7 +1110,37 @@ mod native {
             queue: QueueId,
             max_packets: u16,
         ) -> Result<Vec<Packet>, DpdkError> {
-            self.fallback.rx_burst(port_id, queue, max_packets)
+            let mut mbufs = vec![std::ptr::null_mut(); max_packets as usize];
+            // Safety: `mbufs` is valid for `max_packets` pointers and DPDK
+            // fills at most that many entries.
+            let received = unsafe {
+                dpdk_sys::bypass_dpdk_rx_burst(
+                    port_id,
+                    queue.get(),
+                    mbufs.as_mut_ptr(),
+                    max_packets,
+                )
+            };
+            let mut packets = Vec::with_capacity(received as usize);
+            for mbuf in mbufs.into_iter().take(received as usize) {
+                if mbuf.is_null() {
+                    continue;
+                }
+                // Safety: mbuf was returned by DPDK RX and remains owned by us
+                // until freed below.
+                let len = unsafe { dpdk_sys::bypass_dpdk_pktmbuf_pkt_len(mbuf) as usize };
+                let data = unsafe { dpdk_sys::bypass_dpdk_pktmbuf_data(mbuf).cast::<u8>() };
+                if !data.is_null() {
+                    // Safety: DPDK reports `len` bytes of packet data.
+                    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+                    packets.push(Packet::from_bytes(bytes.to_vec()));
+                }
+                // Safety: received mbuf is owned by this function after RX.
+                unsafe {
+                    dpdk_sys::bypass_dpdk_pktmbuf_free(mbuf);
+                }
+            }
+            Ok(packets)
         }
 
         fn tx_burst(
@@ -987,7 +1149,27 @@ mod native {
             queue: QueueId,
             packets: &[Packet],
         ) -> Result<u16, DpdkError> {
-            self.fallback.tx_burst(port_id, queue, packets)
+            let pool = self.mempool()?;
+            let mut mbufs = packets
+                .iter()
+                .map(|packet| self.packet_to_mbuf(pool, packet.bytes()))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Safety: mbufs contains mbufs allocated from the configured pool.
+            let sent = unsafe {
+                dpdk_sys::bypass_dpdk_tx_burst(
+                    port_id,
+                    queue.get(),
+                    mbufs.as_mut_ptr(),
+                    mbufs.len() as u16,
+                )
+            };
+            for mbuf in mbufs.into_iter().skip(sent as usize) {
+                // Safety: unsent mbufs are still owned by this function.
+                unsafe {
+                    dpdk_sys::bypass_dpdk_pktmbuf_free(mbuf);
+                }
+            }
+            Ok(sent)
         }
 
         fn join_multicast(
@@ -996,7 +1178,11 @@ mod native {
             group: MulticastGroup,
             queue: QueueId,
         ) -> Result<(), DpdkError> {
-            self.fallback.join_multicast(port_id, group, queue)
+            let _ = (port_id, group, queue);
+            Err(DpdkError::OperationFailed {
+                operation: "rte_flow_create",
+                rc: -1,
+            })
         }
 
         fn read_packet(
@@ -1005,7 +1191,21 @@ mod native {
             queue: QueueId,
             buf: &mut PooledBuf,
         ) -> Result<usize, DpdkError> {
-            self.fallback.read_packet(port_id, queue, buf)
+            let packets = self.rx_burst(port_id, queue, 1)?;
+            let Some(packet) = packets.first() else {
+                return Ok(0);
+            };
+            if packet.bytes().len() > buf.len() {
+                return Err(DpdkError::PacketTooLarge {
+                    len: packet.bytes().len(),
+                    max: buf.len(),
+                });
+            }
+            // Safety: the caller supplied `&mut PooledBuf`, so this runtime has
+            // exclusive access while copying packet bytes into the buffer.
+            let slice = unsafe { buf.buf_mut().as_slice_mut() };
+            slice[..packet.bytes().len()].copy_from_slice(packet.bytes());
+            Ok(packet.bytes().len())
         }
 
         fn write_packet(
@@ -1014,7 +1214,13 @@ mod native {
             queue: QueueId,
             buf: &PooledBuf,
         ) -> Result<usize, DpdkError> {
-            self.fallback.write_packet(port_id, queue, buf)
+            let packet = Packet::from_bytes(buf.buf().as_slice().to_vec());
+            let sent = self.tx_burst(port_id, queue, &[packet])?;
+            if sent == 0 {
+                Ok(0)
+            } else {
+                Ok(buf.len())
+            }
         }
 
         fn read_packets(
@@ -1023,7 +1229,18 @@ mod native {
             queue: QueueId,
             bufs: &mut [PooledBuf],
         ) -> Result<usize, DpdkError> {
-            self.fallback.read_packets(port_id, queue, bufs)
+            let mut total = 0usize;
+            for buf in bufs {
+                let read = self.read_packet(port_id, queue, buf)?;
+                total = total.checked_add(read).ok_or(DpdkError::OperationFailed {
+                    operation: "read_packets length overflow",
+                    rc: -1,
+                })?;
+                if read == 0 {
+                    break;
+                }
+            }
+            Ok(total)
         }
 
         fn write_packets(
@@ -1032,12 +1249,29 @@ mod native {
             queue: QueueId,
             bufs: &[PooledBuf],
         ) -> Result<usize, DpdkError> {
-            self.fallback.write_packets(port_id, queue, bufs)
+            let packets = bufs
+                .iter()
+                .map(|buf| Packet::from_bytes(buf.buf().as_slice().to_vec()))
+                .collect::<Vec<_>>();
+            let sent = self.tx_burst(port_id, queue, &packets)?;
+            Ok(bufs.iter().take(sent as usize).map(PooledBuf::len).sum())
         }
 
         fn poll_port(&self, port_id: u16) -> usize {
-            self.fallback.poll_port(port_id)
+            let _ = port_id;
+            0
         }
+    }
+
+    fn hardware_enabled(name: &str) -> bool {
+        std::env::var(name)
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
     }
 }
 

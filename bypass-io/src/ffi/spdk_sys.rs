@@ -75,6 +75,30 @@ pub type SpdkRc = c_int;
 
 #[cfg(bypass_io_native_spdk)]
 unsafe extern "C" {
+    /// Initialize the SPDK environment with default options.
+    pub fn bypass_spdk_env_init(name: *const c_char) -> SpdkRc;
+
+    /// Finalize the SPDK environment.
+    pub fn bypass_spdk_env_fini();
+
+    /// Return true when an NVMe completion represents an error.
+    pub fn bypass_spdk_cpl_is_error(completion: *const spdk_nvme_cpl) -> bool;
+
+    /// Return an SPDK-owned status string for an NVMe completion.
+    pub fn bypass_spdk_cpl_status_string(completion: *const spdk_nvme_cpl) -> *const c_char;
+
+    /// Allocate DMA-capable memory from the SPDK environment.
+    pub fn spdk_zmalloc(
+        size: usize,
+        align: usize,
+        phys_addr: *mut u64,
+        socket_id: c_int,
+        flags: u32,
+    ) -> *mut c_void;
+
+    /// Free memory allocated by [`spdk_zmalloc`].
+    pub fn spdk_free(buf: *mut c_void);
+
     /// Probe NVMe controllers.
     pub fn spdk_nvme_probe(
         trid: *const spdk_nvme_transport_id,
@@ -101,6 +125,9 @@ unsafe extern "C" {
     /// Return an active namespace handle.
     pub fn spdk_nvme_ctrlr_get_ns(ctrlr: *mut spdk_nvme_ctrlr, nsid: u32) -> *mut spdk_nvme_ns;
 
+    /// Detach an NVMe controller.
+    pub fn spdk_nvme_detach(ctrlr: *mut spdk_nvme_ctrlr) -> SpdkRc;
+
     /// Allocate an I/O queue pair.
     pub fn spdk_nvme_ctrlr_alloc_io_qpair(
         ctrlr: *mut spdk_nvme_ctrlr,
@@ -108,11 +135,17 @@ unsafe extern "C" {
         opts_size: usize,
     ) -> *mut spdk_nvme_qpair;
 
+    /// Free an I/O queue pair.
+    pub fn spdk_nvme_ctrlr_free_io_qpair(qpair: *mut spdk_nvme_qpair) -> SpdkRc;
+
     /// Return the namespace sector size.
     pub fn spdk_nvme_ns_get_sector_size(ns: *const spdk_nvme_ns) -> u32;
 
     /// Return the namespace capacity in sectors.
     pub fn spdk_nvme_ns_get_num_sectors(ns: *const spdk_nvme_ns) -> u64;
+
+    /// Return the namespace maximum I/O transfer size in bytes.
+    pub fn spdk_nvme_ns_get_max_io_xfer_size(ns: *mut spdk_nvme_ns) -> u32;
 
     /// Submit an NVMe namespace read.
     pub fn spdk_nvme_ns_cmd_read(

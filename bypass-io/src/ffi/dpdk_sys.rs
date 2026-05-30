@@ -4,6 +4,8 @@
 //! boundary. It intentionally does not link DPDK functions yet, so
 //! `--all-features` builds work on machines without DPDK installed.
 
+#[cfg(bypass_io_native_dpdk)]
+use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 
 /// Opaque `struct rte_mempool`.
@@ -125,6 +127,49 @@ unsafe extern "C" {
         actions: *const rte_flow_action,
         error: *mut rte_flow_error,
     ) -> *mut rte_flow;
+
+    /// Configure, queue-setup, and start an Ethernet port using default queue configs.
+    pub fn bypass_dpdk_configure_port(
+        port_id: u16,
+        rx_queues: u16,
+        tx_queues: u16,
+        rx_desc: u16,
+        tx_desc: u16,
+        pool: *mut rte_mempool,
+        socket_id: c_int,
+        promiscuous: c_int,
+    ) -> RteRc;
+
+    /// Inline wrapper for `rte_eth_rx_burst`.
+    pub fn bypass_dpdk_rx_burst(
+        port_id: u16,
+        queue_id: u16,
+        rx_pkts: *mut *mut rte_mbuf,
+        nb_pkts: u16,
+    ) -> u16;
+
+    /// Inline wrapper for `rte_eth_tx_burst`.
+    pub fn bypass_dpdk_tx_burst(
+        port_id: u16,
+        queue_id: u16,
+        tx_pkts: *mut *mut rte_mbuf,
+        nb_pkts: u16,
+    ) -> u16;
+
+    /// Inline wrapper for `rte_pktmbuf_alloc`.
+    pub fn bypass_dpdk_pktmbuf_alloc(pool: *mut rte_mempool) -> *mut rte_mbuf;
+
+    /// Inline wrapper for `rte_pktmbuf_free`.
+    pub fn bypass_dpdk_pktmbuf_free(buf: *mut rte_mbuf);
+
+    /// Inline wrapper for `rte_pktmbuf_append`.
+    pub fn bypass_dpdk_pktmbuf_append(buf: *mut rte_mbuf, len: u16) -> *mut c_void;
+
+    /// Inline wrapper for `rte_pktmbuf_mtod`.
+    pub fn bypass_dpdk_pktmbuf_data(buf: *mut rte_mbuf) -> *mut c_void;
+
+    /// Inline wrapper for `rte_pktmbuf_pkt_len`.
+    pub fn bypass_dpdk_pktmbuf_pkt_len(buf: *mut rte_mbuf) -> u32;
 }
 
 // DPDK's packet burst and mbuf data-access APIs are header-inline in common

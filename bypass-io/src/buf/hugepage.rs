@@ -5,6 +5,11 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
 use std::slice;
+#[cfg(all(feature = "spdk", bypass_io_native_spdk))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(all(feature = "spdk", bypass_io_native_spdk))]
+use crate::ffi::spdk_sys;
 
 const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
@@ -43,6 +48,8 @@ pub enum HugePageSize {
 /// Actual memory backing selected for a [`HugeBuf`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HugeBufBacking {
+    /// Memory allocated by the SPDK environment for native DMA.
+    SpdkDma,
     /// Linux accepted the requested `MAP_HUGETLB` mapping.
     HugePage,
     /// Linux could not provide a huge page, but the fallback mapping was locked.
@@ -114,6 +121,13 @@ impl HugeBuf {
     /// fallback mapping fail.
     pub fn alloc(len: usize, page_size: HugePageSize) -> io::Result<Self> {
         let len = round_up(len, page_size.bytes().get())?;
+        #[cfg(all(feature = "spdk", bypass_io_native_spdk))]
+        if spdk_dma_allocations_enabled() {
+            if let Some(buf) = spdk_dma_alloc(len, page_size)? {
+                return Ok(buf);
+            }
+        }
+
         let allocation = mmap_preferred(len, page_size)?;
         let virt = allocation.virt;
         prefault_mapping(virt, len);
@@ -202,6 +216,39 @@ impl HugeBuf {
     }
 }
 
+#[cfg(all(feature = "spdk", bypass_io_native_spdk))]
+static SPDK_DMA_ALLOCATIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(feature = "spdk", bypass_io_native_spdk))]
+pub(crate) fn enable_spdk_dma_allocations() {
+    SPDK_DMA_ALLOCATIONS_ENABLED.store(true, Ordering::Release);
+}
+
+#[cfg(all(feature = "spdk", bypass_io_native_spdk))]
+fn spdk_dma_allocations_enabled() -> bool {
+    SPDK_DMA_ALLOCATIONS_ENABLED.load(Ordering::Acquire)
+}
+
+#[cfg(all(feature = "spdk", bypass_io_native_spdk))]
+fn spdk_dma_alloc(len: usize, page_size: HugePageSize) -> io::Result<Option<HugeBuf>> {
+    let mut phys = 0u64;
+    // Safety: the SPDK environment has been initialized before this path is
+    // enabled. `spdk_zmalloc` returns a DMA-safe allocation or null on failure.
+    let ptr = unsafe { spdk_sys::spdk_zmalloc(len, page_size.bytes().get(), &mut phys, -1, 0) };
+    let Some(virt) = NonNull::new(ptr.cast::<u8>()) else {
+        return Ok(None);
+    };
+    Ok(Some(HugeBuf {
+        virt,
+        phys: Some(phys),
+        len,
+        page_size,
+        backing: HugeBufBacking::SpdkDma,
+        locked: true,
+        uring_buf_index: None,
+    }))
+}
+
 fn prefault_mapping(virt: NonNull<u8>, len: usize) {
     // Safety: `virt` points to a writable mapping of `len` bytes. Touching the
     // full range faults pages in before pagemap inspection.
@@ -212,6 +259,16 @@ fn prefault_mapping(virt: NonNull<u8>, len: usize) {
 
 impl Drop for HugeBuf {
     fn drop(&mut self) {
+        #[cfg(all(feature = "spdk", bypass_io_native_spdk))]
+        if matches!(self.backing, HugeBufBacking::SpdkDma) {
+            // Safety: `virt` was returned by `spdk_zmalloc` and is freed once
+            // by this owner.
+            unsafe {
+                spdk_sys::spdk_free(self.virt.as_ptr().cast::<c_void>());
+            }
+            return;
+        }
+
         // Safety: `virt` was returned by `mmap` and has not been unmapped yet.
         unsafe {
             if self.locked {

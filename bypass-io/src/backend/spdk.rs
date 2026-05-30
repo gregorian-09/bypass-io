@@ -503,6 +503,8 @@ pub enum SpdkError {
         /// SPDK return code.
         rc: i32,
     },
+    /// SPDK completion polling timed out before an operation completed.
+    CompletionTimeout,
     /// NVMe completion reported an error status.
     CompletionFailed {
         /// Completion status code.
@@ -544,6 +546,7 @@ impl fmt::Display for SpdkError {
             }
             Self::LengthOverflow => write!(f, "I/O vector lengths overflowed usize"),
             Self::SubmitFailed { rc } => write!(f, "SPDK submission failed with rc={rc}"),
+            Self::CompletionTimeout => write!(f, "SPDK completion polling timed out"),
             Self::CompletionFailed { status } => {
                 write!(f, "SPDK completion failed with status={status}")
             }
@@ -557,6 +560,7 @@ impl Error for SpdkError {}
 struct SpdkBufferSegment {
     _addr: usize,
     len: usize,
+    backing: HugeBufBacking,
 }
 
 impl SpdkBufferSegment {
@@ -581,6 +585,7 @@ impl SpdkBufferSegment {
         Ok(Self {
             _addr: huge.virt_addr().as_ptr() as usize,
             len: huge.len(),
+            backing: huge.backing(),
         })
     }
 
@@ -730,27 +735,58 @@ fn total_pooled_len<'a>(mut bufs: impl Iterator<Item = &'a PooledBuf>) -> Result
 
 #[cfg(bypass_io_native_spdk)]
 mod native {
+    use std::ffi::{c_void, CString};
+    use std::ptr::NonNull;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
     use super::{
-        runtime_unavailable, IoQueuePair, NvmeNamespace, SpdkBackend, SpdkBufferSegment, SpdkError,
-        SpdkRuntime, UnavailableSpdkRuntime,
+        runtime_unavailable, IoQueuePair, NvmeController, NvmeLbaRange, NvmeNamespace, SpdkBackend,
+        SpdkBufferSegment, SpdkError, SpdkRuntime, COMPLETIONS_PER_POLL,
     };
+    use crate::buf::{hugepage, HugeBufBacking};
     use crate::ffi::spdk_sys;
 
-    /// Native SPDK adapter scaffold.
-    ///
-    /// This type exists only when the build script has enabled
-    /// `bypass_io_native_spdk`. It documents the exact place where future SPDK C
-    /// calls will live, but it deliberately delegates every operation to the
-    /// unavailable runtime until the unsafe completion and DMA ownership model
-    /// is implemented and tested on hardware.
+    const HARDWARE_ENABLE_ENV: &str = "BYPASS_IO_ENABLE_SPDK_HARDWARE";
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[derive(Clone, Copy)]
+    struct NativeCtrlr(NonNull<spdk_sys::spdk_nvme_ctrlr>);
+
+    #[derive(Clone, Copy)]
+    struct NativeNamespace {
+        nsid: u32,
+        ns: NonNull<spdk_sys::spdk_nvme_ns>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct NativeQpair(NonNull<spdk_sys::spdk_nvme_qpair>);
+
+    // Safety: controller and namespace metadata calls are thread-safe in SPDK;
+    // qpair access is additionally serialized through a Mutex below.
+    unsafe impl Send for NativeCtrlr {}
+    unsafe impl Sync for NativeCtrlr {}
+    unsafe impl Send for NativeNamespace {}
+    unsafe impl Sync for NativeNamespace {}
+    unsafe impl Send for NativeQpair {}
+
+    /// Native SPDK runtime adapter.
     pub(super) struct NativeSpdkRuntime {
-        fallback: UnavailableSpdkRuntime,
+        controllers: Vec<NativeCtrlr>,
+        namespaces: Vec<NativeNamespace>,
+        qpairs: Vec<Mutex<NativeQpair>>,
     }
 
     impl NativeSpdkRuntime {
-        pub(super) const fn new() -> Self {
+        fn new(
+            controllers: Vec<NativeCtrlr>,
+            namespaces: Vec<NativeNamespace>,
+            qpairs: Vec<NativeQpair>,
+        ) -> Self {
             Self {
-                fallback: UnavailableSpdkRuntime,
+                controllers,
+                namespaces,
+                qpairs: qpairs.into_iter().map(Mutex::new).collect(),
             }
         }
 
@@ -762,7 +798,81 @@ mod native {
                 "spdk_nvme_ns_cmd_write",
                 "spdk_nvme_ns_cmd_flush",
                 "spdk_nvme_qpair_process_completions",
+                "spdk_zmalloc",
+                "spdk_free",
             ]
+        }
+
+        fn namespace(&self, nsid: u32) -> Result<NativeNamespace, SpdkError> {
+            self.namespaces
+                .iter()
+                .copied()
+                .find(|namespace| namespace.nsid == nsid)
+                .ok_or(SpdkError::NamespaceNotFound { nsid })
+        }
+
+        fn qpair(&self, qpair: &IoQueuePair) -> Result<&Mutex<NativeQpair>, SpdkError> {
+            self.qpairs
+                .get(qpair.id())
+                .ok_or(SpdkError::NoQueuePairsConfigured)
+        }
+
+        fn check_segment(segment: SpdkBufferSegment) -> Result<SpdkBufferSegment, SpdkError> {
+            if segment.backing != HugeBufBacking::SpdkDma {
+                return Err(SpdkError::DmaBufferUnavailable {
+                    detail: "native SPDK I/O requires buffers allocated after SPDK environment initialization",
+                });
+            }
+            Ok(segment)
+        }
+
+        fn submit_payload_io(
+            &self,
+            namespace: &NvmeNamespace,
+            qpair: &IoQueuePair,
+            segment: SpdkBufferSegment,
+            range: NvmeLbaRange,
+            submit: unsafe extern "C" fn(
+                *mut spdk_sys::spdk_nvme_ns,
+                *mut spdk_sys::spdk_nvme_qpair,
+                *mut c_void,
+                u64,
+                u32,
+                Option<spdk_sys::SpdkNvmeIoCompletionCb>,
+                *mut c_void,
+                u32,
+            ) -> spdk_sys::SpdkRc,
+        ) -> Result<usize, SpdkError> {
+            let segment = Self::check_segment(segment)?;
+            let native_ns = self.namespace(namespace.nsid())?;
+            let lba_count =
+                u32::try_from(range.lba_count).map_err(|_| SpdkError::LengthOverflow)?;
+            let qpair = self.qpair(qpair)?.lock().unwrap();
+            let mut completion = NativeCompletion::default();
+            let payload = segment._addr as *mut c_void;
+            // Safety: native handles were obtained from SPDK during
+            // initialization, payload points at an SPDK DMA allocation, and the
+            // completion context lives until polling observes completion.
+            let rc = unsafe {
+                submit(
+                    native_ns.ns.as_ptr(),
+                    qpair.0.as_ptr(),
+                    payload,
+                    range.lba,
+                    lba_count,
+                    Some(native_io_completion),
+                    (&mut completion as *mut NativeCompletion).cast::<c_void>(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                return Err(SpdkError::SubmitFailed { rc });
+            }
+            wait_for_completion(*qpair, &mut completion)?;
+            if completion.failed {
+                return Err(SpdkError::CompletionFailed { status: 1 });
+            }
+            Ok((range.lba_count as usize) * namespace.sector_size() as usize)
         }
     }
 
@@ -774,7 +884,13 @@ mod native {
             segment: SpdkBufferSegment,
             range: super::NvmeLbaRange,
         ) -> Result<usize, SpdkError> {
-            self.fallback.read(namespace, qpair, segment, range)
+            self.submit_payload_io(
+                namespace,
+                qpair,
+                segment,
+                range,
+                spdk_sys::spdk_nvme_ns_cmd_read,
+            )
         }
 
         fn write(
@@ -784,7 +900,13 @@ mod native {
             segment: SpdkBufferSegment,
             range: super::NvmeLbaRange,
         ) -> Result<usize, SpdkError> {
-            self.fallback.write(namespace, qpair, segment, range)
+            self.submit_payload_io(
+                namespace,
+                qpair,
+                segment,
+                range,
+                spdk_sys::spdk_nvme_ns_cmd_write,
+            )
         }
 
         fn readv(
@@ -794,7 +916,25 @@ mod native {
             segments: &mut [SpdkBufferSegment],
             range: super::NvmeLbaRange,
         ) -> Result<usize, SpdkError> {
-            self.fallback.readv(namespace, qpair, segments, range)
+            let mut lba = range.lba;
+            let mut total = 0usize;
+            for segment in segments {
+                let lba_count = segment.len / namespace.sector_size() as usize;
+                let read = self.read(
+                    namespace,
+                    qpair,
+                    *segment,
+                    NvmeLbaRange {
+                        lba,
+                        lba_count: lba_count as u64,
+                    },
+                )?;
+                lba = lba
+                    .checked_add(lba_count as u64)
+                    .ok_or(SpdkError::LengthOverflow)?;
+                total = total.checked_add(read).ok_or(SpdkError::LengthOverflow)?;
+            }
+            Ok(total)
         }
 
         fn writev(
@@ -804,27 +944,250 @@ mod native {
             segments: &[SpdkBufferSegment],
             range: super::NvmeLbaRange,
         ) -> Result<usize, SpdkError> {
-            self.fallback.writev(namespace, qpair, segments, range)
+            let mut lba = range.lba;
+            let mut total = 0usize;
+            for segment in segments {
+                let lba_count = segment.len / namespace.sector_size() as usize;
+                let written = self.write(
+                    namespace,
+                    qpair,
+                    *segment,
+                    NvmeLbaRange {
+                        lba,
+                        lba_count: lba_count as u64,
+                    },
+                )?;
+                lba = lba
+                    .checked_add(lba_count as u64)
+                    .ok_or(SpdkError::LengthOverflow)?;
+                total = total
+                    .checked_add(written)
+                    .ok_or(SpdkError::LengthOverflow)?;
+            }
+            Ok(total)
         }
 
         fn flush(&self, namespace: &NvmeNamespace, qpair: &IoQueuePair) -> Result<(), SpdkError> {
-            self.fallback.flush(namespace, qpair)
+            let native_ns = self.namespace(namespace.nsid())?;
+            let qpair = self.qpair(qpair)?.lock().unwrap();
+            let mut completion = NativeCompletion::default();
+            // Safety: native handles were created by SPDK and the completion
+            // context remains alive until polling completes.
+            let rc = unsafe {
+                spdk_sys::spdk_nvme_ns_cmd_flush(
+                    native_ns.ns.as_ptr(),
+                    qpair.0.as_ptr(),
+                    Some(native_io_completion),
+                    (&mut completion as *mut NativeCompletion).cast::<c_void>(),
+                )
+            };
+            if rc != 0 {
+                return Err(SpdkError::SubmitFailed { rc });
+            }
+            wait_for_completion(*qpair, &mut completion)?;
+            if completion.failed {
+                return Err(SpdkError::CompletionFailed { status: 1 });
+            }
+            Ok(())
         }
 
         fn process_completions(&self, qpair: &IoQueuePair, max_completions: u32) -> usize {
-            self.fallback.process_completions(qpair, max_completions)
+            let Ok(qpair) = self.qpair(qpair) else {
+                return 0;
+            };
+            let qpair = qpair.lock().unwrap();
+            // Safety: qpair is a live SPDK I/O qpair and access is serialized.
+            let rc = unsafe {
+                spdk_sys::spdk_nvme_qpair_process_completions(qpair.0.as_ptr(), max_completions)
+            };
+            usize::try_from(rc.max(0)).unwrap_or(0)
+        }
+    }
+
+    impl Drop for NativeSpdkRuntime {
+        fn drop(&mut self) {
+            for qpair in &self.qpairs {
+                if let Ok(qpair) = qpair.lock() {
+                    // Safety: qpair was allocated by SPDK and is freed once.
+                    let _ = unsafe { spdk_sys::spdk_nvme_ctrlr_free_io_qpair(qpair.0.as_ptr()) };
+                }
+            }
+            for controller in &self.controllers {
+                // Safety: controller was attached by SPDK and is detached once.
+                let _ = unsafe { spdk_sys::spdk_nvme_detach(controller.0.as_ptr()) };
+            }
+            // Safety: this runtime owns the environment initialization path.
+            unsafe {
+                spdk_sys::bypass_spdk_env_fini();
+            }
         }
     }
 
     pub(super) fn probe_and_init() -> Result<SpdkBackend, SpdkError> {
-        let _runtime = NativeSpdkRuntime::new();
+        if !hardware_enabled(HARDWARE_ENABLE_ENV) {
+            return Err(runtime_unavailable());
+        }
+
         let _symbols = NativeSpdkRuntime::required_symbols();
-        let _ffi_markers = (
-            core::mem::size_of::<spdk_sys::spdk_nvme_ctrlr>(),
-            core::mem::size_of::<spdk_sys::spdk_nvme_ns>(),
-            core::mem::size_of::<spdk_sys::spdk_nvme_qpair>(),
+        let app_name = CString::new("bypass-io").unwrap();
+        // Safety: wrapper initializes SPDK with default options and a stable C
+        // string for the duration of the call.
+        let rc = unsafe { spdk_sys::bypass_spdk_env_init(app_name.as_ptr()) };
+        if rc != 0 {
+            return Err(SpdkError::SubmitFailed { rc });
+        }
+        hugepage::enable_spdk_dma_allocations();
+
+        let mut state = ProbeState::default();
+        // Safety: callbacks only store controller pointers provided by SPDK
+        // during the synchronous probe call.
+        let rc = unsafe {
+            spdk_sys::spdk_nvme_probe(
+                std::ptr::null(),
+                (&mut state as *mut ProbeState).cast::<c_void>(),
+                Some(probe_cb),
+                Some(attach_cb),
+                None,
+            )
+        };
+        if rc != 0 {
+            return Err(SpdkError::SubmitFailed { rc });
+        }
+
+        let Some(controller) = state.controllers.first().copied() else {
+            return Err(SpdkError::RuntimeUnavailable {
+                detail: "native SPDK probe found no controllers",
+            });
+        };
+
+        let mut public_namespaces = Vec::new();
+        let mut native_namespaces = Vec::new();
+        // Safety: controller is attached and live for namespace discovery.
+        let mut nsid =
+            unsafe { spdk_sys::spdk_nvme_ctrlr_get_first_active_ns(controller.as_ptr()) };
+        while nsid != 0 {
+            // Safety: controller is live and nsid came from SPDK's active list.
+            let ns = unsafe { spdk_sys::spdk_nvme_ctrlr_get_ns(controller.as_ptr(), nsid) };
+            if let Some(ns) = NonNull::new(ns) {
+                // Safety: namespace handle is live while controller is attached.
+                let sector = unsafe { spdk_sys::spdk_nvme_ns_get_sector_size(ns.as_ptr()) };
+                let capacity = unsafe { spdk_sys::spdk_nvme_ns_get_num_sectors(ns.as_ptr()) };
+                let max_io = unsafe { spdk_sys::spdk_nvme_ns_get_max_io_xfer_size(ns.as_ptr()) };
+                public_namespaces.push(NvmeNamespace::new(nsid, sector, capacity, max_io)?);
+                native_namespaces.push(NativeNamespace { nsid, ns });
+            }
+            // Safety: controller is live and nsid is the previous active nsid.
+            nsid =
+                unsafe { spdk_sys::spdk_nvme_ctrlr_get_next_active_ns(controller.as_ptr(), nsid) };
+        }
+
+        if public_namespaces.is_empty() {
+            return Err(SpdkError::RuntimeUnavailable {
+                detail: "native SPDK probe found no active namespaces",
+            });
+        }
+
+        // Safety: controller is live; null opts requests SPDK defaults.
+        let qpair = unsafe {
+            spdk_sys::spdk_nvme_ctrlr_alloc_io_qpair(controller.as_ptr(), std::ptr::null(), 0)
+        };
+        let qpair = NonNull::new(qpair).ok_or(SpdkError::NoQueuePairsConfigured)?;
+        let runtime = NativeSpdkRuntime::new(
+            vec![NativeCtrlr(controller)],
+            native_namespaces,
+            vec![NativeQpair(qpair)],
         );
-        Err(runtime_unavailable())
+
+        Ok(SpdkBackend {
+            controller: NvmeController::new("spdk-native", None),
+            namespaces: public_namespaces.into(),
+            qpairs: vec![IoQueuePair::new(0)].into(),
+            runtime: Arc::new(runtime),
+        })
+    }
+
+    #[derive(Default)]
+    struct ProbeState {
+        controllers: Vec<NonNull<spdk_sys::spdk_nvme_ctrlr>>,
+    }
+
+    unsafe extern "C" fn probe_cb(
+        _cb_ctx: *mut c_void,
+        _trid: *const spdk_sys::spdk_nvme_transport_id,
+        _opts: *mut spdk_sys::spdk_nvme_ctrlr_opts,
+    ) -> bool {
+        true
+    }
+
+    unsafe extern "C" fn attach_cb(
+        cb_ctx: *mut c_void,
+        _trid: *const spdk_sys::spdk_nvme_transport_id,
+        ctrlr: *mut spdk_sys::spdk_nvme_ctrlr,
+        _opts: *const spdk_sys::spdk_nvme_ctrlr_opts,
+    ) {
+        if let (Some(state), Some(ctrlr)) = (
+            // Safety: SPDK passes back the `ProbeState` pointer provided to
+            // `spdk_nvme_probe`.
+            unsafe { (cb_ctx as *mut ProbeState).as_mut() },
+            NonNull::new(ctrlr),
+        ) {
+            state.controllers.push(ctrlr);
+        }
+    }
+
+    #[derive(Default)]
+    struct NativeCompletion {
+        done: bool,
+        failed: bool,
+    }
+
+    unsafe extern "C" fn native_io_completion(
+        ctx: *mut c_void,
+        completion: *const spdk_sys::spdk_nvme_cpl,
+    ) {
+        // Safety: ctx points to the stack-owned completion state passed during
+        // submission and remains live until polling observes completion.
+        if let Some(state) = unsafe { (ctx as *mut NativeCompletion).as_mut() } {
+            state.done = true;
+            state.failed = completion.is_null()
+                // Safety: completion is provided by SPDK for this callback.
+                || unsafe { spdk_sys::bypass_spdk_cpl_is_error(completion) };
+        }
+    }
+
+    fn wait_for_completion(
+        qpair: NativeQpair,
+        completion: &mut NativeCompletion,
+    ) -> Result<(), SpdkError> {
+        let start = Instant::now();
+        while !completion.done {
+            if start.elapsed() > COMPLETION_TIMEOUT {
+                return Err(SpdkError::CompletionTimeout);
+            }
+            // Safety: qpair is live and access is serialized by the caller.
+            let rc = unsafe {
+                spdk_sys::spdk_nvme_qpair_process_completions(
+                    qpair.0.as_ptr(),
+                    COMPLETIONS_PER_POLL,
+                )
+            };
+            if rc < 0 {
+                return Err(SpdkError::SubmitFailed { rc });
+            }
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+
+    fn hardware_enabled(name: &str) -> bool {
+        std::env::var(name)
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
     }
 }
 

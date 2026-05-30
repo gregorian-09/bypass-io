@@ -4,11 +4,10 @@ Hardware validation is the Tier 3 path for `bypass-io`. It is intentionally
 separate from normal local checks, lightweight CI, and native dependency build
 CI because real SPDK/DPDK validation depends on host-level state.
 
-This repository can check whether a host is ready for hardware validation, but
-the current Rust backends still report native runtime status as `linked =
-false`. That means the hardware workflow verifies the machine and Rust feature
-surface today; it does not yet claim real NVMe or NIC I/O through native SPDK or
-DPDK symbols.
+This repository can check whether a host is ready for hardware validation. The
+native SPDK and DPDK adapters also include runtime-gated C call paths, but they
+remain disabled unless the operator explicitly enables them with hardware opt-in
+environment variables.
 
 ## Host Requirements
 
@@ -111,6 +110,14 @@ The workflow runs:
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `tools/hardware/validate_host.sh` with the dispatch inputs
 
+Native hardware I/O is intentionally not enabled by this workflow by default.
+To run the hardware-gated paths manually on the runner, set:
+
+```bash
+export BYPASS_IO_ENABLE_SPDK_HARDWARE=1
+export BYPASS_IO_ENABLE_DPDK_HARDWARE=1
+```
+
 ## Validation Procedure
 
 Use this sequence to validate the hardware path:
@@ -134,16 +141,16 @@ bash tools/hardware/validate_host.sh \
 
 For the current repository state, a passing hardware workflow means the host is
 ready, the Rust feature surface builds, and the selected PCI devices are visible
-with the expected driver setup. It does not yet mean that native SPDK NVMe
-commands or DPDK RX/TX bursts were executed.
+with the expected driver setup. Real native I/O requires the runtime opt-in
+variables above plus native link flags.
 
 ## Boundary
 
 This workflow validates host readiness and Rust feature gates. True hardware I/O
-still requires native-runtime work where `SpdkBackend::native_status()` or
-`DpdkBackend::native_status()` reports `linked = true`, native link checks pass
-on the target host, native symbols are actually called, and device-specific I/O
-tests are executed against bound hardware.
+requires `SpdkBackend::native_status()` or `DpdkBackend::native_status()` to
+report `linked = true`, native link checks to pass on the target host, runtime
+hardware opt-in variables to be set, and device-specific I/O tests to execute
+against bound hardware.
 
 See `docs/native-linking.md` for the opt-in native link-check environment
 variables, and `docs/native-runtime-adapters.md` for the unsafe adapter boundary
